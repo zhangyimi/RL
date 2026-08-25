@@ -11,6 +11,7 @@ policy:
   generation:
     nvfp4_pertoken_rollout:
       enabled: true
+      experimental_scale_only_reload: false
       additional_ignore:
       - '*.layers.0.mlp.experts*'
       - '*.layers.1.mlp.experts*'

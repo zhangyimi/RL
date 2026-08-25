@@ -59,7 +59,6 @@ NVFP4_PER_TOKEN_METHOD = "nvfp4_pertoken"
 _EXPERT_WEIGHT_RE = re.compile(
     r"^(?P<prefix>.*\.experts)\.(?P<eid>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
 )
-
 _FP4_MAX = 6.0
 _FP8_E4M3_MAX = 448.0
 _AMAX_DENOMINATOR = _FP4_MAX * _FP8_E4M3_MAX
@@ -99,8 +98,11 @@ class NvFp4PerTokenQuantizer:
     that layer's ``quant_method`` at engine build time.
     """
 
-    def __init__(self, model: torch.nn.Module) -> None:
+    def __init__(
+        self, model: torch.nn.Module, *, emit_input_scales: bool = True
+    ) -> None:
         self._model = model
+        self._emit_input_scales = emit_input_scales
         self._pending: dict[tuple[str, int], PendingHalf] = {}
         self._quantized_layer: dict[str, bool] = {}
         self._quantized_events = 0
@@ -225,22 +227,26 @@ class NvFp4PerTokenQuantizer:
         )
         return packed, scale
 
-    @staticmethod
     def _emit(
+        self,
         name_prefix: str,
         packed: torch.Tensor,
         scale: torch.Tensor,
         weight_scale_2: torch.Tensor,
     ) -> list[tuple[str, torch.Tensor]]:
-        return [
+        out = [
             (f"{name_prefix}.weight", packed),
             (f"{name_prefix}.weight_scale", scale),
             (f"{name_prefix}.weight_scale_2", weight_scale_2.to(torch.float32)),
-            (
-                f"{name_prefix}.input_scale",
-                torch.ones((), device=packed.device, dtype=torch.float32),
-            ),
         ]
+        if self._emit_input_scales:
+            out.append(
+                (
+                    f"{name_prefix}.input_scale",
+                    torch.ones((), device=packed.device, dtype=torch.float32),
+                )
+            )
+        return out
 
     def finish(self) -> None:
         """Raise if any gate/up half never received its partner this refit.
@@ -465,6 +471,7 @@ def configure_nvfp4_pertoken_engine_kwargs(
     llm_kwargs: dict[str, Any],
     ignore: list[str],
     *,
+    experimental_scale_only_reload: bool,
     explicit_engine_kwargs: dict[str, Any] | None = None,
 ) -> None:
     """Mutate vLLM engine kwargs for the per-token W4A4 rollout.
@@ -484,14 +491,31 @@ def configure_nvfp4_pertoken_engine_kwargs(
         llm_kwargs if explicit_engine_kwargs is None else explicit_engine_kwargs
     )
     _reject_conflicting_engine_kwargs(conflict_source)
+    if experimental_scale_only_reload:
+        # Deferred because the optional module imports the base classes above.
+        from nemo_rl.models.generation.vllm.quantization.nvfp4_scale_only_reload import (
+            require_full_expert_scale_loader,
+        )
+
+        require_full_expert_scale_loader()
     register_nvfp4_pertoken()
     llm_kwargs["quantization"] = NVFP4_PER_TOKEN_METHOD
     llm_kwargs["load_format"] = "dummy"
     hf_overrides = llm_kwargs.setdefault("hf_overrides", {})
     hf_overrides["quantization_config"] = build_nvfp4_pertoken_hf_quant_config(ignore)
+    extension_module = (
+        "nvfp4_scale_only_reload"
+        if experimental_scale_only_reload
+        else "nvfp4_pertoken"
+    )
+    extension_class = (
+        "NvFp4PerTokenScaleOnlyWorkerExtension"
+        if experimental_scale_only_reload
+        else "NvFp4PerTokenWorkerExtension"
+    )
     llm_kwargs["worker_extension_cls"] = (
-        "nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken."
-        "NvFp4PerTokenWorkerExtension"
+        "nemo_rl.models.generation.vllm.quantization."
+        f"{extension_module}.{extension_class}"
     )
 
 

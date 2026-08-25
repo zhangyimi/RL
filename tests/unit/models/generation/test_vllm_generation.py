@@ -684,9 +684,15 @@ def test_main_worker_configures_nvfp4_pertoken_engine_kwargs(monkeypatch):
     fake_vllm_module = types.ModuleType(module_name)
     captured = {}
 
-    def configure(llm_kwargs, ignore, explicit_engine_kwargs):
+    def configure(
+        llm_kwargs,
+        ignore,
+        experimental_scale_only_reload,
+        explicit_engine_kwargs,
+    ):
         captured["kwargs"] = llm_kwargs
         captured["ignore"] = ignore
+        captured["experimental_scale_only_reload"] = experimental_scale_only_reload
         captured["explicit_engine_kwargs"] = explicit_engine_kwargs
         llm_kwargs["quantization"] = "nvfp4_pertoken"
 
@@ -700,6 +706,7 @@ def test_main_worker_configures_nvfp4_pertoken_engine_kwargs(monkeypatch):
             "nvfp4_pertoken_rollout": {
                 "enabled": True,
                 "additional_ignore": [layer_ignore],
+                "experimental_scale_only_reload": True,
             },
             "vllm_kwargs": {"hf_overrides": {"max_position_embeddings": 4096}},
         },
@@ -709,6 +716,7 @@ def test_main_worker_configures_nvfp4_pertoken_engine_kwargs(monkeypatch):
     assert captured == {
         "kwargs": llm_kwargs,
         "ignore": [*DEFAULT_NVFP4_IGNORE, layer_ignore],
+        "experimental_scale_only_reload": True,
         "explicit_engine_kwargs": {"hf_overrides": {"max_position_embeddings": 4096}},
     }
     assert llm_kwargs["quantization"] == "nvfp4_pertoken"
@@ -782,7 +790,11 @@ def test_nvfp4_pertoken_rejects_conflicting_engine_kwargs(llm_kwargs):
     )
 
     with pytest.raises(ValueError, match="nvfp4_pertoken"):
-        configure_nvfp4_pertoken_engine_kwargs(llm_kwargs, ignore=DEFAULT_NVFP4_IGNORE)
+        configure_nvfp4_pertoken_engine_kwargs(
+            llm_kwargs,
+            ignore=DEFAULT_NVFP4_IGNORE,
+            experimental_scale_only_reload=False,
+        )
 
 
 def test_main_worker_without_nvfp4_pertoken_keeps_engine_kwargs():

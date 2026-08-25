@@ -37,6 +37,15 @@ def nvfp4_module():
     yield M
 
 
+@pytest.fixture()
+def scale_only_module(nvfp4_module):
+    from nemo_rl.models.generation.vllm.quantization import (
+        nvfp4_scale_only_reload as M,
+    )
+
+    return M
+
+
 def _quantizer_with_layer_quantized(M, quantized: bool):
     """Build a quantizer whose owning-module probe is stubbed to a fixed verdict.
 
@@ -49,6 +58,7 @@ def _quantizer_with_layer_quantized(M, quantized: bool):
     quantizer._pending = {}
     quantizer._quantized_layer = {}
     quantizer._quantized_events = 0
+    quantizer._emit_input_scales = True
     quantizer._is_quantized_layer = lambda _prefix: quantized
     return quantizer
 
@@ -269,6 +279,22 @@ def test_emits_all_eight_names_per_expert(nvfp4_module, monkeypatch):
     assert len(out) == 12
 
 
+def test_scale_only_quantizer_omits_constant_input_scales(nvfp4_module, monkeypatch):
+    M = nvfp4_module
+    _fake_scaled_fp4_quant(monkeypatch, M)
+    quantizer = _quantizer_with_layer_quantized(M, True)
+    quantizer._emit_input_scales = False
+    prefix = "model.layers.0.mlp.experts.0.down_proj"
+
+    out = dict(quantizer.process([(f"{prefix}.weight", torch.randn(8, 32))]))
+
+    assert set(out) == {
+        f"{prefix}.weight",
+        f"{prefix}.weight_scale",
+        f"{prefix}.weight_scale_2",
+    }
+
+
 def test_rejects_swizzled_scale_shape(nvfp4_module, monkeypatch):
     """The default swizzled layout must be caught, not silently accepted.
 
@@ -302,6 +328,7 @@ def test_rollout_config_defaults(nvfp4_module):
     M = nvfp4_module
     cfg = M.NvFp4PerTokenRolloutConfig()
     assert cfg.enabled is False
+    assert cfg.experimental_scale_only_reload is False
     assert cfg.quant_patterns == ["*.experts.*"]
     assert cfg.resolved_ignore() == M.DEFAULT_NVFP4_IGNORE
 
@@ -310,6 +337,11 @@ def test_rollout_config_defaults(nvfp4_module):
         {"enabled": True, "additional_ignore": [layer_ignore]}
     )
     assert cfg2.resolved_ignore() == [*M.DEFAULT_NVFP4_IGNORE, layer_ignore]
+
+    cfg3 = M.NvFp4PerTokenRolloutConfig.model_validate(
+        {"enabled": True, "experimental_scale_only_reload": True}
+    )
+    assert cfg3.experimental_scale_only_reload is True
 
     with pytest.raises(ValidationError, match="unknown_key"):
         M.NvFp4PerTokenRolloutConfig.model_validate({"enabled": True, "unknown_key": 1})
@@ -332,6 +364,133 @@ def test_rollout_config_rejects_partial_expert_ignore(nvfp4_module, pattern):
         M.NvFp4PerTokenRolloutConfig.model_validate(
             {"enabled": True, "additional_ignore": [pattern]}
         )
+
+
+# ------------------------------------------------------------- scale-only reload
+
+
+def _expert_scales(prefix: str, num_experts: int):
+    pieces = []
+    by_name = {}
+    for expert_id in range(num_experts):
+        for projection_index, projection in enumerate(
+            ("gate_proj", "up_proj", "down_proj")
+        ):
+            value = 100 * expert_id + 10 * projection_index
+            scale_shape = (4, 1) if projection == "down_proj" else (2, 2)
+            tensors = {
+                "weight_scale": torch.full(scale_shape, value + 1),
+                "weight_scale_2": torch.tensor(float(value + 2)),
+                "input_scale": torch.tensor(float(value + 3)),
+            }
+            for kind, tensor in tensors.items():
+                name = f"{prefix}.{expert_id}.{projection}.{kind}"
+                pieces.append((name, tensor))
+                by_name[name] = tensor
+    return pieces, by_name
+
+
+def test_scale_only_coalescer_keeps_weights_and_coalesces_scales(scale_only_module):
+    M = scale_only_module
+    prefix = "model.layers.2.mlp.experts"
+    scales, source = _expert_scales(prefix, num_experts=2)
+    packed_name = f"{prefix}.0.down_proj.weight"
+    packed_weight = torch.ones(4, 2, dtype=torch.uint8)
+    coalescer = M.NvFp4ScaleOnlyCoalescer({prefix: 2})
+
+    first = coalescer.process([(packed_name, packed_weight), *scales[:9]])
+    assert first == [(packed_name, packed_weight)]
+    coalesced = dict(coalescer.process(scales[9:]))
+    coalescer.finish()
+
+    assert set(coalesced) == {
+        f"{prefix}.{projection}.{kind}"
+        for projection in ("gate_up_proj", "down_proj")
+        for kind in (*M._WEIGHT_SCALE_KINDS, "input_scale")
+    }
+    for kind in M._WEIGHT_SCALE_KINDS:
+        expected_w13 = []
+        expected_w2 = []
+        for expert_id in range(2):
+            gate = source[f"{prefix}.{expert_id}.gate_proj.{kind}"]
+            up = source[f"{prefix}.{expert_id}.up_proj.{kind}"]
+            down = source[f"{prefix}.{expert_id}.down_proj.{kind}"]
+            if kind == "weight_scale":
+                expected_w13.append(torch.cat((gate, up), dim=0))
+                expected_w2.append(down)
+            else:
+                expected_w13.append(torch.stack((gate.reshape(()), up.reshape(()))))
+                expected_w2.append(down.reshape(()))
+
+        assert torch.equal(
+            coalesced[f"{prefix}.gate_up_proj.{kind}"],
+            torch.stack(expected_w13),
+        )
+        assert torch.equal(
+            coalesced[f"{prefix}.down_proj.{kind}"],
+            torch.stack(expected_w2),
+        )
+    assert torch.equal(
+        coalesced[f"{prefix}.gate_up_proj.input_scale"], torch.ones(2, 2)
+    )
+    assert torch.equal(coalesced[f"{prefix}.down_proj.input_scale"], torch.ones(2))
+    assert coalescer.coalesced_layers == 1
+
+
+def test_scale_only_coalescer_rejects_incomplete_layer(scale_only_module):
+    M = scale_only_module
+    prefix = "model.layers.2.mlp.experts"
+    scales, _ = _expert_scales(prefix, num_experts=2)
+    coalescer = M.NvFp4ScaleOnlyCoalescer({prefix: 2})
+
+    assert coalescer.process(scales[:1]) == []
+    with pytest.raises(RuntimeError, match="incomplete layers"):
+        coalescer.finish()
+
+
+def test_scale_only_reload_requires_vllm_capability(scale_only_module, monkeypatch):
+    M = scale_only_module
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    monkeypatch.setattr(
+        RoutedExperts, "supports_full_expert_scale_loading", False, raising=False
+    )
+    model = types.SimpleNamespace(modules=lambda: [])
+    with pytest.raises(RuntimeError, match="vLLM full-expert-scale loader patch"):
+        M._get_expected_experts(model)
+
+
+def test_configure_selects_scale_only_extension(nvfp4_module):
+    M = nvfp4_module
+    kwargs = {}
+    M.configure_nvfp4_pertoken_engine_kwargs(
+        kwargs,
+        ignore=M.DEFAULT_NVFP4_IGNORE,
+        experimental_scale_only_reload=True,
+    )
+
+    assert kwargs["worker_extension_cls"].endswith(
+        ".nvfp4_scale_only_reload.NvFp4PerTokenScaleOnlyWorkerExtension"
+    )
+
+
+def test_configure_default_does_not_require_vllm_patch(nvfp4_module, monkeypatch):
+    M = nvfp4_module
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    monkeypatch.setattr(
+        RoutedExperts, "supports_full_expert_scale_loading", False, raising=False
+    )
+    kwargs = {}
+    M.configure_nvfp4_pertoken_engine_kwargs(
+        kwargs,
+        ignore=M.DEFAULT_NVFP4_IGNORE,
+        experimental_scale_only_reload=False,
+    )
+
+    assert kwargs["worker_extension_cls"].endswith(
+        ".nvfp4_pertoken.NvFp4PerTokenWorkerExtension"
+    )
 
 
 # ------------------------------------------------------------- worker extension

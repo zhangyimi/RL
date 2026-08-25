@@ -108,6 +108,7 @@ policy:
       enabled: true
     nvfp4_pertoken_rollout:
       enabled: true
+      experimental_scale_only_reload: false
       additional_ignore:
         - "*.layers.0.mlp.experts*"
         - "*.layers.1.mlp.experts*"
@@ -250,13 +251,15 @@ The load phase is Python-call-bound. Qwen3-30B-A3B emits 64,512 per-expert
 checkpoint names per refit across 42 quantized layers and 128 experts, and each
 name passes through vLLM's mapping, loader, and layerwise-reload bookkeeping.
 
-A research-only prototype coalesced those outputs into eight full fused-expert
-parameters per layer. In paired 90-step runs, the final per-expert path measured
-18.42 seconds mean and median refit time; the prototype measured 6.31 seconds
-mean and 6.38 seconds median, a 2.92x improvement. Both runs completed
-successfully. The prototype is not part of this feature because complete
-fused-parameter loading depends on vLLM's internal expert layout and should be
-implemented upstream. The proposal and reproducible evidence are tracked in
+A fully stacked research prototype coalesced those outputs into eight full
+fused-expert parameters per layer. In paired 90-step runs, the final per-expert
+path measured 18.42 seconds mean and median refit time; the prototype measured
+6.31 seconds mean and 6.38 seconds median, a 2.92x improvement. Both runs
+completed successfully. Complete fused-weight loading depends on vLLM's
+internal expert layout and should be implemented upstream. A smaller,
+default-off [scale-only reload](nvfp4-scale-only-reload.md) is available for
+review; it preserves packed-weight loading and coalesces only scale records.
+The broader proposal and reproducible evidence are tracked in
 [vLLM issue #53687](https://github.com/vllm-project/vllm/issues/53687), in
 coordination with vLLM's streaming quantization-unit RFC
 [#53192](https://github.com/vllm-project/vllm/issues/53192).

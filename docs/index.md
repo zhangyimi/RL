@@ -226,6 +226,13 @@ Run quantized GRPO and distillation with NVIDIA ModelOpt.
 Run W4A4 policy training and per-token vLLM rollout on NVIDIA Blackwell GPUs.
 :::
 
+:::{grid-item-card} {octicon}`sync` NVFP4 Scale-Only Refit
+:link: design-docs/nvfp4-scale-only-reload
+:link-type: doc
+
+Review the experimental layerwise scale reload and its vLLM compatibility patch.
+:::
+
 :::{grid-item-card} {octicon}`container` Docker Containers
 :link: docker
 :link-type: doc

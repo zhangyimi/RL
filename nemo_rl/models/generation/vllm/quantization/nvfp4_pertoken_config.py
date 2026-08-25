@@ -54,6 +54,7 @@ class NvFp4PerTokenRolloutConfig(BaseModel, extra="forbid"):
     """User configuration for the constrained per-token NVFP4 rollout."""
 
     enabled: bool = False
+    experimental_scale_only_reload: bool = False
     additional_ignore: Annotated[
         list[str], AfterValidator(_require_full_expert_layer_ignores)
     ] = Field(default_factory=list)
