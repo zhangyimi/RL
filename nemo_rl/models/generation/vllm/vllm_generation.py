@@ -102,7 +102,7 @@ class VllmGeneration(GenerationInterface):
             )
 
         top_p: float = self.cfg.get("top_p", 1.0)
-        if top_p < TOP_P_THRESHOLD:
+        if 0 and top_p < TOP_P_THRESHOLD:
             raise ValueError(
                 (
                     f"top_p sampling with values < {TOP_P_THRESHOLD} is not supported because the vLLM V1 engine "

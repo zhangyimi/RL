@@ -187,7 +187,12 @@ def is_correct_minerva(
 
     # Process ground truth
     if gt_need_extract:
-        gt = normalize_final_answer(remove_boxed(last_boxed_only_string(gt)))
+        boxed_gt = last_boxed_only_string(gt)
+        if boxed_gt is not None:
+            gt = normalize_final_answer(remove_boxed(boxed_gt))
+        else:
+            # If no boxed answer found, use the original gt
+            gt = normalize_final_answer(gt)
     else:
         gt = normalize_final_answer(gt)
 
@@ -242,7 +247,7 @@ def verify(
         correct, pred = is_correct_strict_box(solution_str, answer, pause_tokens_index)
         return correct == 1, pred
 
-    correct, pred = is_correct_minerva(solution_str, answer)
+    correct, pred = is_correct_minerva(solution_str, answer, gt_need_extract=True)
     return correct, pred
 
 

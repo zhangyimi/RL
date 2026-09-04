@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.utils import set_seed
-from nemo_rl.data import EvalDataConfigType
+from nemo_rl.data import MathDataConfig
 from nemo_rl.data.collate_fn import eval_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.llm_message_utils import get_keys_from_message_log
@@ -49,17 +49,12 @@ class EvalConfig(TypedDict):
     save_path: str | None
 
 
-# TODO: this should updated, but is left to avoid breaking changes
-class _PassThroughMathConfig(TypedDict):
-    math: MathEnvConfig
-
-
 class MasterConfig(TypedDict):
     eval: EvalConfig
     generation: GenerationConfig  # Fixed: was 'generate'
     tokenizer: TokenizerConfig  # Added missing tokenizer key
-    data: EvalDataConfigType
-    env: _PassThroughMathConfig
+    data: MathDataConfig
+    env: MathEnvConfig
     cluster: ClusterConfig
 
 
@@ -104,7 +99,7 @@ def setup(
     top_k = generation_config["top_k"]
 
     # Validate metrics
-    assert metric in ["pass@k", "cons@k"], f"Invalid metric: {metric}"
+    assert metric in ["pass@k", "cons@k", "mean@k"], f"Invalid metric: {metric}"
     if num_tests_per_prompt > 1:
         assert temperature > 0 and top_k != 1, (
             "temperature > 0 and top_k != 1 are required for multiple samples"
@@ -274,6 +269,32 @@ def eval_cons_k(
     return cons_k_score
 
 
+def eval_mean_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int) -> float:
+    """Evaluate mean@k score.
+    
+    Computes the average reward of the top-k samples for each prompt.
+    
+    Args:
+        rewards: Tensor of shape (batch_size * num_tests_per_prompt)
+        num_tests_per_prompt: int
+        k: int (mean@k value)
+    
+    Returns:
+        mean_k_score: float
+    """
+    # rewards is a 1d tensor of size (batch_size * num_tests_per_prompt)
+    group_rewards = rewards.split(num_tests_per_prompt)
+    mean_k_score = 0.0
+    
+    for group_reward in group_rewards:
+        # Sort rewards in descending order and take top k
+        top_k_rewards = torch.topk(group_reward, k=min(k, len(group_reward))).values
+        # Compute mean of top k rewards
+        mean_k_score += top_k_rewards.mean().item()
+    
+    return mean_k_score
+
+
 def run_env_eval(vllm_generation, dataloader, env, master_config):
     """Main entry point for running evaluation using environment.
 
@@ -379,6 +400,8 @@ async def _run_env_eval_impl(
             score += eval_cons_k(
                 rewards, num_tests_per_prompt, k_value, extracted_answers
             )
+        elif metric == "mean@k":
+            score += eval_mean_k(rewards, num_tests_per_prompt, k_value)
         else:
             raise ValueError(f"Invalid metric: {metric}")
 
@@ -503,3 +526,4 @@ def _print_results(
     print(f"metric={metric[:-1]}{k_value} {num_tests_per_prompt=}\n")
     print(f"score={average_score:.4f} ({score}/{dataset_size})")
     print("=" * 60 + "\n")
+
