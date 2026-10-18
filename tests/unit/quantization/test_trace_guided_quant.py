@@ -290,8 +290,9 @@ def test_fast_nudge_bit_identical(k, mode):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
-@pytest.mark.parametrize("width", [0, 1, 2, 4])
-def test_fast_kv_fake_bit_identical(monkeypatch, width):
+@pytest.mark.parametrize("fp8_dq", [False, True])
+@pytest.mark.parametrize("width,match", [(0, None), (1, None), (2, None), (4, None), (4, 2), (4, 4)])
+def test_fast_kv_fake_bit_identical(monkeypatch, width, match, fp8_dq):
     pytest.importorskip("megatron.core")
     from nemo_rl.models.megatron import trace_probe as tp
     from nemo_rl.quantization.trace.codec import fp4_lsb_from_packed, fp4_low2_from_packed
@@ -308,9 +309,16 @@ def test_fast_kv_fake_bit_identical(monkeypatch, width):
     payload = {0: None, 1: fp4_lsb_from_packed(codes), 2: fp4_low2_from_packed(codes), 4: codes}[width]
     rsf = sf if width else None
     monkeypatch.setenv(tp.VERIFY_ENV, "1")
-    ref, st = tp._nvfp4_kv_fake(x, gs, rsf, payload, valid, max(width, 1))
+    ref, st = tp._nvfp4_kv_fake(x, gs, rsf, payload, valid, max(width, 1), match, fp8_dq)
     monkeypatch.setenv(tp.VERIFY_ENV, "0")
-    got, _ = tp._nvfp4_kv_fake(x, gs, rsf, payload, valid, max(width, 1))
+    got, _ = tp._nvfp4_kv_fake(x, gs, rsf, payload, valid, max(width, 1), match, fp8_dq)
     assert torch.equal(got.view(torch.int16), ref.view(torch.int16))
     if width:
         assert st["flipped"] > 0
+    if match == 4 and not fp8_dq:
+        # Copy reproduces the rollout codes on valid rows.
+        q = ref.float().view(n, h, d // 16, 16) / (sf.float().unsqueeze(-1) * gs)
+        got_c = guided_e2m1(q.clamp(-6, 6).view(n * h, d))[1].view(n, h, d)
+        rc = (codes.view(n, h, d // 2).unsqueeze(-1) >> torch.tensor([0, 4], device="cuda", dtype=torch.uint8)).flatten(-2) & 15
+        same = (got_c == rc) | (((got_c & 7) == 0) & ((rc & 7) == 0))
+        assert same[valid].all()

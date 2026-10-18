@@ -167,7 +167,8 @@ def trace_nudge_rowscaled_fast(
 def _kv_fake_kernel(
     x_ptr, out_ptr, sf_ptr, g_ptr, valid_ptr, flips_ptr,
     H, gscale, inv6g,
-    D: tl.constexpr, WIDTH: tl.constexpr, HAS_ROLL: tl.constexpr,
+    D: tl.constexpr, WIDTH: tl.constexpr, HAS_ROLL: tl.constexpr, MATCH: tl.constexpr,
+    FP8_DQ: tl.constexpr,
 ):
     # One program per (token, head) row of D elements.
     r = tl.program_id(0)
@@ -201,34 +202,47 @@ def _kv_fake_kernel(
     tie_up = (lower & 1) == 1
     rtn = tl.where(on_grid | (mag < mid) | ((mag == mid) & ~tie_up), lower, upper)
     code = rtn
+    sign = neg
     if HAS_ROLL:
         bit = offs * WIDTH
         gb = tl.load(g_ptr + r.to(tl.int64) * (D * WIDTH // 8) + bit // 8).to(tl.int32)
         g = (gb >> (bit % 8)) & ((1 << WIDTH) - 1)
-        if WIDTH == 2:
+        gsign = neg
+        if MATCH == 4:
+            # Copy the rollout code (upper bound; full-code records only).
+            guided = g & 7
+            gsign = (g & 8) != 0
+        elif MATCH == 2:
             best = tl.zeros_like(lower)
             best_d = tl.zeros_like(mag) + 1e30
             for c in tl.static_range(8):
-                ok = (c & 3) == g
+                ok = (c & 3) == (g & 3)
                 d = tl.abs(_mag_of(tl.zeros_like(lower) + c) - mag)
                 take = ok & (d < best_d)
                 best = tl.where(take, c, best)
                 best_d = tl.where(take, d, best_d)
             guided = best
         else:
-            lsb = g & 1  # WIDTH 4: full code, guided by its mantissa bit
+            lsb = g & 1
             guided = tl.where((lower & 1) == lsb, lower, upper)
             guided = tl.where(on_grid, rtn, guided)
         code = tl.where(valid, guided, rtn)
-    flip = code != rtn
+        sign = tl.where(valid, gsign, neg)
+    flip = (code != rtn) | (sign != neg)
     v = _mag_of(code)
-    v = tl.where(neg, -v, v)
-    q = (v * scale_e).to(x_raw.dtype)
+    v = tl.where(sign, -v, v)
+    if FP8_DQ:
+        # trtllm-gen: e2m1 * block scale -> FP8 E4M3, global scale applied after.
+        sf_e = tl.reshape(tl.broadcast_to(sf[:, None], (D // 16, 16)), (D,))
+        q = ((v * sf_e).to(tl.float8e4nv).to(tl.float32) * gscale).to(x_raw.dtype)
+    else:
+        q = (v * scale_e).to(x_raw.dtype)
     tl.store(out_ptr + r.to(tl.int64) * D + offs, q)
     tl.atomic_add(flips_ptr, tl.sum(flip.to(tl.int32), axis=0))
 
 
-def kv_fake_fast(x, gscale, roll_sf, roll_payload, valid, width: int = 1):
+def kv_fake_fast(x, gscale, roll_sf, roll_payload, valid, width: int = 1, match: int | None = None,
+                 fp8_dq: bool = False):
     """Fused NVFP4 KV quant->dequant (see ``trace_probe._nvfp4_kv_fake``).
 
     Returns the dequantized tensor (no straight-through wrapping) and stats.
@@ -252,5 +266,6 @@ def kv_fake_fast(x, gscale, roll_sf, roll_payload, valid, width: int = 1):
         _kv_fake_kernel[(n * h,)](
             x, out, sf, g, vflag, flips, h, float(g32), float(inv),
             D=d, WIDTH=width, HAS_ROLL=has_roll,
+            MATCH=(match if match is not None else (width if width < 4 else 1)), FP8_DQ=fp8_dq,
         )
     return out, {"flipped_t": flips}

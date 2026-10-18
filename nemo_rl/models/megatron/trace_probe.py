@@ -408,6 +408,8 @@ def _nvfp4_kv_fake(
     roll_payload: Optional[torch.Tensor],  # [n, H, D*width/8] uint8 record code bits
     valid: Optional[torch.Tensor],  # [n] bool
     width: int = 1,
+    match: Optional[int] = None,
+    fp8_dq: bool = False,
 ) -> tuple[torch.Tensor, dict]:
     """NVFP4 KV quant->dequant (rollout cache semantics), optionally TRACE-guided.
 
@@ -415,14 +417,15 @@ def _nvfp4_kv_fake(
     "normalise with the rollout scale"); other rows recompute
     ``e4m3(vmax / (6 * gscale))``. ``width`` is the record's bits per element:
     1 = mantissa bit (bracket rule), 2 = two low code bits (nearest code
-    carrying them), 4 = full codes (guided by their mantissa bit).
+    carrying them), 4 = full codes (guided by their mantissa bit, or by
+    ``match`` = 2 low bits / 4 = copy the rollout code, for upper bounds).
     Straight-through gradient. Uses the fused Triton kernel on CUDA unless
     ``NRL_TRACE_VERIFY=1``.
     """
     if x.is_cuda and os.environ.get(VERIFY_ENV) != "1":
         from nemo_rl.quantization.trace.nudge_triton import kv_fake_fast
 
-        q, st = kv_fake_fast(x.detach(), gscale, roll_sf, roll_payload, valid, width)
+        q, st = kv_fake_fast(x.detach(), gscale, roll_sf, roll_payload, valid, width, match, fp8_dq)
         stats = {"fast_calls": 1}
         if os.environ.get(PROBE_DIR_ENV):
             stats["flipped"] = int(st["flipped_t"])
@@ -445,15 +448,23 @@ def _nvfp4_kv_fake(
         from nemo_rl.quantization.trace.codec import low2_to_packed_codes, unpack_bits
         from nemo_rl.quantization.trace.guided_quant import nearest_code_with_low_bits
 
-        if width == 2:
-            low = unpack_fp4_nibbles(low2_to_packed_codes(roll_payload))
+        m = match if match is not None else (width if width < 4 else 1)
+        if m == 4:
+            codes = unpack_fp4_nibbles(roll_payload)
+        elif m == 2:
+            low = unpack_fp4_nibbles(low2_to_packed_codes(roll_payload) if width == 2 else roll_payload)
             mag = nearest_code_with_low_bits(z, low, 2).to(torch.uint8)
             codes = mag | ((z < 0).to(torch.uint8) << 3)
         else:
             lsb = unpack_bits(roll_payload) if width == 1 else (unpack_fp4_nibbles(roll_payload) & 1).bool()
             codes, _ = guided_e2m1(z, lsb)
         codes = torch.where(valid.view(n, 1, 1), codes, rtn)
-    q = (_dequant(codes).view(n, h, d // 16, 16) * scale).view(n, h, d)
+    if fp8_dq:
+        # trtllm-gen dequantizes e2m1 * block scale to FP8 E4M3, global scale after.
+        g32 = torch.tensor(gscale, dtype=torch.float32, device=x.device)
+        q = ((_dequant(codes).view(n, h, d // 16, 16) * sf).to(torch.float8_e4m3fn).float() * g32).view(n, h, d)
+    else:
+        q = (_dequant(codes).view(n, h, d // 16, 16) * scale).view(n, h, d)
     out = x + (q.to(x.dtype) - x).detach()
     stats = {"elements": n * h * d, "flipped": int((codes != rtn).sum())}
     return out, stats
@@ -485,8 +496,25 @@ def _apply_attention_quant(layer: int, args: tuple, kwargs: dict):
     acc = _APPLY_STATS.setdefault(("kv", layer), collections.Counter())
     if mode is not None:
         (ksf, kp, kw), (vsf, vp, vw) = roll["k"], roll["v"]
-        k_new, st_k = _nvfp4_kv_fake(k2, scales["k"], ksf, kp, valid, kw)
-        v_new, st_v = _nvfp4_kv_fake(v2, scales["v"], vsf, vp, valid, vw)
+        # Upper-bound/analysis modes on full-code records: kvcopy, kvb2.
+        match_k = match_v = None
+        if kw == 4:
+            match_k = match_v = 4 if "kvcopy" in modes else 2 if "kvb2" in modes else None
+            # Per-side copy (analysis): kvcopyk / kvcopyv.
+            if "kvcopyk" in modes:
+                match_k = 4
+            if "kvcopyv" in modes:
+                match_v = 4
+        fp8_dq = "kv8" in modes
+        k_new, st_k = _nvfp4_kv_fake(k2, scales["k"], ksf, kp, valid, kw, match_k, fp8_dq)
+        v_new, st_v = _nvfp4_kv_fake(v2, scales["v"], vsf, vp, valid, vw, match_v, fp8_dq)
+        if kw == 4 and os.environ.get(PROBE_DIR_ENV) and not torch.is_grad_enabled() and valid.any():
+            # Post-guidance KV code agreement with the rollout (under rollout scales).
+            for name, new, sf, p in (("k", k_new, ksf, kp), ("v", v_new, vsf, vp)):
+                got = _kv_codes_under_scale(new.detach()[valid], sf[valid], scales[name])
+                roll_c = unpack_fp4_nibbles(p[valid])
+                st = _code_stats(got, roll_c)
+                acc.update({f"post_{name}_{a}": b for a, b in st.items()})
         acc.update(st_k)
         acc.update({f"v_{a}": b for a, b in st_v.items()})
         k, v = k_new.view(k.shape), v_new.view(v.shape)

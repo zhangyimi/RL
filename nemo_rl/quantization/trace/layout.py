@@ -129,7 +129,7 @@ class TraceLayout:
             self.fc1_records[layer] = SiteRecord(layer, offset, rows, mode)
             offset += rows
         for layer in self.kv_layers:
-            mode = "full" if self.mode_for(layer) == "full" else {1: "lsb", 2: "b2"}[self.kv_bits]
+            mode = "full" if self.mode_for(layer) == "full" else {1: "lsb", 2: "b2", 4: "full"}[self.kv_bits]
             rows = _ceil_div(self.kv_bytes(mode), self.topk)
             self.kv_records[layer] = SiteRecord(layer, offset, rows, mode)
             offset += rows
