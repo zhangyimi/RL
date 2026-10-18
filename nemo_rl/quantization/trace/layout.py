@@ -35,7 +35,7 @@ Per selected layer, a site record is ``[marker u8 x4 | scales | codes]``:
 
 ``codes`` are the packed E2M1 nibbles (``mode=full``, used by the alignment
 probe), the packed mantissa bits (``mode=lsb``, b=1 TRACE) or the two low code
-bits (``mode=b2``, fc1/fc2 only; KV stays ``lsb``); the mode
+bits (``mode=b2``; KV follows ``NRL_TRACE_KV_BITS``, default 1); the mode
 is per layer (``NRL_TRACE_FULL_LAYERS`` forces full codes on probe layers).
 Records are padded to whole rows.
 """
@@ -55,6 +55,7 @@ KV_LAYERS_ENV = "NRL_TRACE_KV_LAYERS"
 FC2_LAYERS_ENV = "NRL_TRACE_FC2_LAYERS"
 FC2_FULL_ENV = "NRL_TRACE_FC2_FULL"
 FC2_BITS_ENV = "NRL_TRACE_FC2_BITS"
+KV_BITS_ENV = "NRL_TRACE_KV_BITS"
 # Diagnostics: raw BF16 MoE input/output + router logits per token (large).
 DBG_LAYERS_ENV = "NRL_TRACE_DBG_LAYERS"
 MODE_ENV = "NRL_TRACE_MODE"
@@ -106,6 +107,7 @@ class TraceLayout:
     ship_scales: bool = True
     fc2_full: bool = False
     fc2_bits: int = 1
+    kv_bits: int = 1
     fc1_records: dict[int, SiteRecord] = field(default_factory=dict, compare=False)
     kv_records: dict[int, SiteRecord] = field(default_factory=dict, compare=False)
     fc2_records: dict[int, SiteRecord] = field(default_factory=dict, compare=False)
@@ -127,7 +129,7 @@ class TraceLayout:
             self.fc1_records[layer] = SiteRecord(layer, offset, rows, mode)
             offset += rows
         for layer in self.kv_layers:
-            mode = "lsb" if self.mode_for(layer) == "b2" else self.mode_for(layer)
+            mode = "full" if self.mode_for(layer) == "full" else {1: "lsb", 2: "b2"}[self.kv_bits]
             rows = _ceil_div(self.kv_bytes(mode), self.topk)
             self.kv_records[layer] = SiteRecord(layer, offset, rows, mode)
             offset += rows
@@ -227,6 +229,7 @@ def layout_from_env(
         ship_scales=os.environ.get(SHIP_SCALES_ENV, "1") == "1",
         fc2_full=os.environ.get(FC2_FULL_ENV, "0") == "1",
         fc2_bits=int(os.environ.get(FC2_BITS_ENV) or 1),
+        kv_bits=int(os.environ.get(KV_BITS_ENV) or 1),
     )
 
 

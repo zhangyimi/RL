@@ -88,6 +88,20 @@ def guided_e2m1(
     return mag_code.to(torch.uint8) | sign, rtn.to(torch.uint8) | sign
 
 
+def nearest_code_with_low_bits(scaled: torch.Tensor, low: torch.Tensor, bits: int) -> torch.Tensor:
+    """Magnitude code (0..7) nearest to ``|scaled|`` whose low ``bits`` equal ``low``.
+
+    Ties go to the smaller code. This is b>=2 TRACE guidance: with two bits an
+    off-by-two rollout code is still recoverable. Returns int64 magnitude codes.
+    """
+    mags = torch.tensor(E2M1_MAGNITUDES, device=scaled.device, dtype=torch.float32)
+    mask = (1 << bits) - 1
+    codes8 = torch.arange(8, device=scaled.device)
+    ok = (codes8 & mask) == (low.to(torch.int64) & mask).unsqueeze(-1)
+    dist = (mags - scaled.abs().unsqueeze(-1)).abs()
+    return torch.where(ok, dist, torch.full_like(dist, float("inf"))).argmin(-1)
+
+
 @dataclass
 class NVFP4RowScaled:
     """Row-scaled NVFP4 operand in TE's rowwise layout (unswizzled)."""
@@ -239,12 +253,7 @@ def trace_nudge_rowscaled(
         _, rtn = guided_e2m1(scaled)
         guided = unpack_fp4_nibbles(guide_codes_packed)[:, :k]
         if guide_bits < 4:
-            mags_t = torch.tensor(E2M1_MAGNITUDES, device=x.device, dtype=torch.float32)
-            mask = (1 << guide_bits) - 1
-            codes8 = torch.arange(8, device=x.device, dtype=torch.uint8)
-            ok = (codes8.view(1, 1, 8) & mask) == (guided & mask).unsqueeze(-1)
-            dist = (mags_t.view(1, 1, 8) - scaled.abs().unsqueeze(-1)).abs()
-            mag_code = torch.where(ok, dist, torch.full_like(dist, float("inf"))).argmin(-1).to(torch.uint8)
+            mag_code = nearest_code_with_low_bits(scaled, guided, guide_bits).to(torch.uint8)
             guided = mag_code | ((scaled < 0).to(torch.uint8) << 3)
         # Never exceed the block maximum's code: that would move the amax/scale.
         cap = (rtn & 7).view(m, k // BLOCK, BLOCK).amax(dim=-1, keepdim=True)

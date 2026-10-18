@@ -184,3 +184,46 @@ def test_encode_fc1_into_matches_torch_encoder(monkeypatch, mode):
         got = buf[:n, nl + rec.row_offset : nl + rec.row_offset + rec.rows].reshape(n, -1)
         assert torch.equal(got[:, :need], ref[:, :need])
     assert not buf[n:].any() and not buf[:, :nl].any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@pytest.mark.parametrize("bits", [1, 2])
+def test_capture_kv_into_matches_torch_encoder(monkeypatch, bits):
+    from nemo_rl.quantization.trace.encode_triton import capture_kv_into
+
+    monkeypatch.setenv(L.KV_LAYERS_ENV, "3")
+    monkeypatch.setenv(L.MODE_ENV, "lsb")
+    monkeypatch.setenv(L.KV_BITS_ENV, str(bits))
+    hk, d, bs, nb = 4, 128, 16, 9
+    lay = L.layout_from_env(topk=8, hidden_size=2048, num_kv_heads=hk, head_dim=d)
+    rec = lay.kv_records[3]
+    cache = torch.randint(0, 256, (nb, 2 * hk, bs, d // 2 + d // 16), dtype=torch.uint8, device="cuda")
+    slots = torch.tensor([5, 17, -1, 100, 33, 143, 0, 66], device="cuda")
+    n, nl = slots.shape[0], 48
+    buf = torch.zeros((16, nl + lay.extra_rows, 8), dtype=torch.uint8, device="cuda")
+    capture_kv_into(buf, (nl + rec.row_offset) * 8, cache, slots, hk, d, rec.mode)
+    # Torch replica of trace_capture.capture_kv's gather.
+    valid = slots >= 0
+    sl = slots.clamp(min=0)
+    blk, off = sl // bs, sl % bs
+    def split(side):  # copy of vllm.utils.torch_utils.nvfp4_split_data_scale
+        full = side.shape[3]
+        dd, sd = full * 8 // 9, full - full * 8 // 9
+        b, h1, n2 = side.shape[:3]
+        data = torch.as_strided(side, (b, h1, n2, dd), (side.stride(0), side.stride(1) * dd // full, side.stride(2) * dd // full, 1), storage_offset=side.storage_offset())
+        sc = torch.as_strided(side, (b, h1, n2, sd), (side.stride(0), side.stride(1) * sd // full, side.stride(2) * sd // full, 1), storage_offset=side.storage_offset() + h1 * n2 * dd)
+        return data, sc
+
+    s_dim = d // 16
+    kd, ks = split(cache[:, :hk])
+    vd, vs = split(cache[:, hk:])
+    k_d, k_s = kd[blk, :, off], ks[blk, :, off]
+    flat = (off // 4).unsqueeze(1) * (4 * s_dim) + torch.arange(s_dim, device="cuda") * 4 + (off % 4).unsqueeze(1)
+    vsf_t = vs.permute(0, 2, 3, 1)
+    v_s = vsf_t[blk.unsqueeze(1), flat // s_dim, flat % s_dim].permute(0, 2, 1)
+    v_d = vd[blk, :, off]
+    ref = L.encode_kv(lay, rec, k_d, k_s, v_d, v_s, valid).reshape(n, -1)
+    got = buf[:n, nl + rec.row_offset : nl + rec.row_offset + rec.rows].reshape(n, -1)
+    need = lay.kv_bytes(rec.mode)
+    assert torch.equal(got[valid, :need], ref[valid, :need])
+    assert torch.equal(got[~valid, :4], ref[~valid, :4])

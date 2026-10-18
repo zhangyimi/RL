@@ -161,3 +161,96 @@ def trace_nudge_rowscaled_fast(
         )
     # Counters stay on device; callers that log them pay the sync.
     return out, {"flipped_t": flips}
+
+
+@triton.jit
+def _kv_fake_kernel(
+    x_ptr, out_ptr, sf_ptr, g_ptr, valid_ptr, flips_ptr,
+    H, gscale, inv6g,
+    D: tl.constexpr, WIDTH: tl.constexpr, HAS_ROLL: tl.constexpr,
+):
+    # One program per (token, head) row of D elements.
+    r = tl.program_id(0)
+    tok = r // H
+    offs = tl.arange(0, D)
+    x_raw = tl.load(x_ptr + r.to(tl.int64) * D + offs)
+    x = x_raw.to(tl.float32)
+    x2 = tl.reshape(tl.abs(x), (D // 16, 16))
+    own = tl.minimum(tl.max(x2, axis=1) * inv6g, 448.0).to(tl.float8e4nv).to(tl.float32)
+    sf = own
+    if HAS_ROLL:
+        valid = tl.load(valid_ptr + tok).to(tl.int1)
+        rsf = tl.load(sf_ptr + r.to(tl.int64) * (D // 16) + tl.arange(0, D // 16), cache_modifier=".cg")
+        rsf = rsf.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        sf = tl.where(valid, rsf, own)
+    scale = sf * gscale
+    enc = tl.where(scale == 0.0, 0.0, tl.math.div_rn(tl.zeros_like(scale) + 1.0, scale))
+    enc_e = tl.reshape(tl.broadcast_to(enc[:, None], (D // 16, 16)), (D,))
+    scale_e = tl.reshape(tl.broadcast_to(scale[:, None], (D // 16, 16)), (D,))
+    z = tl.minimum(tl.maximum(x * enc_e, -6.0), 6.0)
+    mag = tl.abs(z)
+    neg = z < 0
+    lower = ((mag >= 0.5).to(tl.int32) + (mag >= 1.0).to(tl.int32) + (mag >= 1.5).to(tl.int32)
+             + (mag >= 2.0).to(tl.int32) + (mag >= 3.0).to(tl.int32) + (mag >= 4.0).to(tl.int32)
+             + (mag >= 6.0).to(tl.int32))
+    upper = tl.minimum(lower + 1, 7)
+    lo_v = _mag_of(lower)
+    hi_v = _mag_of(upper)
+    on_grid = lo_v == mag
+    mid = (lo_v + hi_v) * 0.5
+    tie_up = (lower & 1) == 1
+    rtn = tl.where(on_grid | (mag < mid) | ((mag == mid) & ~tie_up), lower, upper)
+    code = rtn
+    if HAS_ROLL:
+        bit = offs * WIDTH
+        gb = tl.load(g_ptr + r.to(tl.int64) * (D * WIDTH // 8) + bit // 8).to(tl.int32)
+        g = (gb >> (bit % 8)) & ((1 << WIDTH) - 1)
+        if WIDTH == 2:
+            best = tl.zeros_like(lower)
+            best_d = tl.zeros_like(mag) + 1e30
+            for c in tl.static_range(8):
+                ok = (c & 3) == g
+                d = tl.abs(_mag_of(tl.zeros_like(lower) + c) - mag)
+                take = ok & (d < best_d)
+                best = tl.where(take, c, best)
+                best_d = tl.where(take, d, best_d)
+            guided = best
+        else:
+            lsb = g & 1  # WIDTH 4: full code, guided by its mantissa bit
+            guided = tl.where((lower & 1) == lsb, lower, upper)
+            guided = tl.where(on_grid, rtn, guided)
+        code = tl.where(valid, guided, rtn)
+    flip = code != rtn
+    v = _mag_of(code)
+    v = tl.where(neg, -v, v)
+    q = (v * scale_e).to(x_raw.dtype)
+    tl.store(out_ptr + r.to(tl.int64) * D + offs, q)
+    tl.atomic_add(flips_ptr, tl.sum(flip.to(tl.int32), axis=0))
+
+
+def kv_fake_fast(x, gscale, roll_sf, roll_payload, valid, width: int = 1):
+    """Fused NVFP4 KV quant->dequant (see ``trace_probe._nvfp4_kv_fake``).
+
+    Returns the dequantized tensor (no straight-through wrapping) and stats.
+    """
+    n, h, d = x.shape
+    x = x.contiguous()
+    out = torch.empty_like(x)
+    flips = torch.zeros(1, dtype=torch.int32, device=x.device)
+    has_roll = roll_payload is not None
+    g32 = torch.tensor(gscale, dtype=torch.float32)
+    inv = torch.reciprocal(torch.tensor(6.0 * gscale, dtype=torch.float32))
+    if has_roll:
+        sf = roll_sf.contiguous().view(torch.uint8)
+        g = roll_payload.contiguous()
+        if g.shape[-1] != d * width // 8:
+            raise ValueError(f"KV payload {g.shape[-1]} B per head, expected {d * width // 8}")
+        vflag = valid.to(torch.int8).contiguous()
+    else:
+        sf = g = vflag = x
+    if n * h:
+        _kv_fake_kernel[(n * h,)](
+            x, out, sf, g, vflag, flips, h, float(g32), float(inv),
+            D=d, WIDTH=width, HAS_ROLL=has_roll,
+        )
+    return out, {"flipped_t": flips}

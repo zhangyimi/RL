@@ -405,31 +405,53 @@ def _nvfp4_kv_fake(
     x: torch.Tensor,  # [n, H, D]
     gscale: float,
     roll_sf: Optional[torch.Tensor],  # [n, H, D/16] e4m3, rollout block scales
-    roll_lsb: Optional[torch.Tensor],  # [n, H, D] bool
+    roll_payload: Optional[torch.Tensor],  # [n, H, D*width/8] uint8 record code bits
     valid: Optional[torch.Tensor],  # [n] bool
+    width: int = 1,
 ) -> tuple[torch.Tensor, dict]:
     """NVFP4 KV quant->dequant (rollout cache semantics), optionally TRACE-guided.
 
     Guided rows use the rollout's own E4M3 block scales (the paper's
     "normalise with the rollout scale"); other rows recompute
-    ``e4m3(vmax / (6 * gscale))``. Straight-through gradient.
+    ``e4m3(vmax / (6 * gscale))``. ``width`` is the record's bits per element:
+    1 = mantissa bit (bracket rule), 2 = two low code bits (nearest code
+    carrying them), 4 = full codes (guided by their mantissa bit).
+    Straight-through gradient. Uses the fused Triton kernel on CUDA unless
+    ``NRL_TRACE_VERIFY=1``.
     """
+    if x.is_cuda and os.environ.get(VERIFY_ENV) != "1":
+        from nemo_rl.quantization.trace.nudge_triton import kv_fake_fast
+
+        q, st = kv_fake_fast(x.detach(), gscale, roll_sf, roll_payload, valid, width)
+        stats = {"fast_calls": 1}
+        if os.environ.get(PROBE_DIR_ENV):
+            stats["flipped"] = int(st["flipped_t"])
+            stats["elements"] = x.numel()
+        return x + (q - x).detach(), stats
     n, h, d = x.shape
     xf = x.detach().float().view(n, h, d // 16, 16)
-    own = (xf.abs().amax(-1, keepdim=True) / (6.0 * gscale)).clamp(max=448.0)
+    inv = torch.reciprocal(torch.tensor(6.0 * gscale, dtype=torch.float32, device=x.device))
+    own = (xf.abs().amax(-1, keepdim=True) * inv).clamp(max=448.0)
     own = own.to(torch.float8_e4m3fn).float()
     sf = own
     if roll_sf is not None:
         rsf = roll_sf.float().view(n, h, d // 16, 1)
         sf = torch.where(valid.view(n, 1, 1, 1), rsf, own)
-    scale = sf * gscale
+    scale = sf * torch.tensor(gscale, dtype=torch.float32, device=x.device)
     enc = torch.where(scale == 0, torch.zeros_like(scale), 1.0 / scale)
     z = (xf * enc).clamp(-6.0, 6.0).view(n, h, d)
-    guide = None
-    if roll_lsb is not None:
-        guide = roll_lsb
-    codes, rtn = guided_e2m1(z, guide)
-    if guide is not None:
+    codes, rtn = guided_e2m1(z)
+    if roll_payload is not None:
+        from nemo_rl.quantization.trace.codec import low2_to_packed_codes, unpack_bits
+        from nemo_rl.quantization.trace.guided_quant import nearest_code_with_low_bits
+
+        if width == 2:
+            low = unpack_fp4_nibbles(low2_to_packed_codes(roll_payload))
+            mag = nearest_code_with_low_bits(z, low, 2).to(torch.uint8)
+            codes = mag | ((z < 0).to(torch.uint8) << 3)
+        else:
+            lsb = unpack_bits(roll_payload) if width == 1 else (unpack_fp4_nibbles(roll_payload) & 1).bool()
+            codes, _ = guided_e2m1(z, lsb)
         codes = torch.where(valid.view(n, 1, 1), codes, rtn)
     q = (_dequant(codes).view(n, h, d // 16, 16) * scale).view(n, h, d)
     out = x + (q.to(x.dtype) - x).detach()
@@ -447,29 +469,24 @@ def _apply_attention_quant(layer: int, args: tuple, kwargs: dict):
         return None
     hk, d = k.shape[-2], k.shape[-1]
     k2, v2 = k.reshape(-1, hk, d), v.reshape(-1, hk, d)
-    roll = {"k": (None, None), "v": (None, None)}
+    roll = {"k": (None, None, 1), "v": (None, None, 1)}
     valid = None
     rows = _ROWS_FULL
     if mode == "kv" and rows is not None and rows.shape[0] == k2.shape[0] and layer in _LAYOUT.kv_records:
         dec = trace_layout.decode_kv(_LAYOUT, rows, layer)
         tp_rank, _ = _tp()
         hs = slice(tp_rank * hk, (tp_rank + 1) * hk)
-        from nemo_rl.quantization.trace.codec import unpack_bits
-
-        def lsb_of(codes):
-            if dec.mode == "full":
-                return (unpack_fp4_nibbles(codes[:, hs]) & 1).bool()
-            return unpack_bits(codes[:, hs])
-
         valid = dec.valid
+        width = {"lsb": 1, "b2": 2, "full": 4}[dec.mode]
         roll = {
-            "k": (dec.k_scale[:, hs], lsb_of(dec.k_codes)),
-            "v": (dec.v_scale[:, hs], lsb_of(dec.v_codes)),
+            "k": (dec.k_scale[:, hs], dec.k_codes[:, hs], width),
+            "v": (dec.v_scale[:, hs], dec.v_codes[:, hs], width),
         }
     acc = _APPLY_STATS.setdefault(("kv", layer), collections.Counter())
     if mode is not None:
-        k_new, st_k = _nvfp4_kv_fake(k2, scales["k"], *roll["k"], valid)
-        v_new, st_v = _nvfp4_kv_fake(v2, scales["v"], *roll["v"], valid)
+        (ksf, kp, kw), (vsf, vp, vw) = roll["k"], roll["v"]
+        k_new, st_k = _nvfp4_kv_fake(k2, scales["k"], ksf, kp, valid, kw)
+        v_new, st_v = _nvfp4_kv_fake(v2, scales["v"], vsf, vp, valid, vw)
         acc.update(st_k)
         acc.update({f"v_{a}": b for a, b in st_v.items()})
         k, v = k_new.view(k.shape), v_new.view(v.shape)
@@ -548,7 +565,8 @@ def _build_fc2_side_payload(layer: int, n_tokens: int, hidden: int, dtype) -> Op
 
 def _decode_fc2_side_rows(g: torch.Tensor, expert_of_row: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     topk, nb = _LAYOUT.topk, _LAYOUT.fc2_slot_bytes
-    b = g.contiguous().view(torch.uint8).view(g.shape[0], -1)
+    # Explicit width: an EP rank can receive zero rows.
+    b = g.contiguous().view(torch.uint8).view(g.shape[0], g.shape[-1] * g.element_size())
     marker_ok = (b[:, 0:4] == trace_layout.MARKER).all(dim=1)
     ids = b[:, 4 : 4 + 2 * topk].contiguous().view(torch.int16).view(-1, topk).to(torch.int64)
     hit = ids == (expert_of_row.view(-1, 1) + 1)

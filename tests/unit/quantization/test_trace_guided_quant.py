@@ -287,3 +287,30 @@ def test_fast_nudge_bit_identical(k, mode):
         got, fs = trace_nudge_rowscaled_fast(x, rp, valid, width=4, match_bits=2)
     assert torch.equal(got.view(torch.int16), ref.view(torch.int16))
     assert int(fs["flipped_t"]) == st["flipped"] > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+@pytest.mark.parametrize("width", [0, 1, 2, 4])
+def test_fast_kv_fake_bit_identical(monkeypatch, width):
+    pytest.importorskip("megatron.core")
+    from nemo_rl.models.megatron import trace_probe as tp
+    from nemo_rl.quantization.trace.codec import fp4_lsb_from_packed, fp4_low2_from_packed
+
+    n, h, d, gs = 257, 4, 128, 0.0123
+    g = torch.Generator("cuda").manual_seed(5)
+    x = (torch.randn(n, h, d, device="cuda", generator=g) * 3).to(torch.bfloat16)
+    valid = torch.rand(n, device="cuda", generator=g) > 0.2
+    xr = (x.float() * (1 + 0.2 * torch.randn(n, h, d, device="cuda", generator=g))).view(n, h, d // 16, 16)
+    sf = (xr.abs().amax(-1) / (6 * gs)).clamp(max=448).to(torch.float8_e4m3fn)
+    z = (xr / (sf.float().unsqueeze(-1) * gs)).clamp(-6, 6).view(n * h, d)
+    from nemo_rl.quantization.trace.guided_quant import guided_e2m1
+    codes = pack_fp4_nibbles(guided_e2m1(z)[1]).view(n, h, d // 2)
+    payload = {0: None, 1: fp4_lsb_from_packed(codes), 2: fp4_low2_from_packed(codes), 4: codes}[width]
+    rsf = sf if width else None
+    monkeypatch.setenv(tp.VERIFY_ENV, "1")
+    ref, st = tp._nvfp4_kv_fake(x, gs, rsf, payload, valid, max(width, 1))
+    monkeypatch.setenv(tp.VERIFY_ENV, "0")
+    got, _ = tp._nvfp4_kv_fake(x, gs, rsf, payload, valid, max(width, 1))
+    assert torch.equal(got.view(torch.int16), ref.view(torch.int16))
+    if width:
+        assert st["flipped"] > 0

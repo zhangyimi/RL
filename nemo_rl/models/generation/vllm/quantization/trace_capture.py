@@ -100,6 +100,11 @@ def _write(rec: trace_layout.SiteRecord, payload: torch.Tensor) -> None:
     buf[:n, row0 : row0 + rec.rows, :] = payload.to(buf.dtype)
 
 
+def _fast_capture() -> bool:
+    """Fused Triton capture unless ``NRL_TRACE_TORCH_CAPTURE=1`` (reference path)."""
+    return os.environ.get("NRL_TRACE_TORCH_CAPTURE") != "1"
+
+
 def capture_fc1(
     packed_codes: torch.Tensor, block_scale: torch.Tensor, token_scale: torch.Tensor
 ) -> None:
@@ -111,7 +116,7 @@ def capture_fc1(
     h = _LAYOUT.hidden_size
     n = packed_codes.shape[0]
     buf = _CAPTURER.device_buffer
-    if not _LAYOUT.ship_scales and buf.is_cuda and buf.dtype == torch.uint8:
+    if _fast_capture() and not _LAYOUT.ship_scales and buf.is_cuda and buf.dtype == torch.uint8:
         # One kernel per layer instead of ~10 small encode ops per decode step.
         from nemo_rl.quantization.trace.encode_triton import encode_fc1_into
 
@@ -200,11 +205,22 @@ def capture_kv(impl: Any, layer: Any, kv_cache: torch.Tensor, slot_mapping: torc
     rec = _LAYOUT.kv_records.get(int(m.group(1)))
     if rec is None:
         return
-    from vllm.utils.torch_utils import nvfp4_split_data_scale
-
     hk = impl.num_kv_heads
     if hk != _LAYOUT.num_kv_heads:
         raise RuntimeError(f"TRACE kv: layout has {_LAYOUT.num_kv_heads} KV heads, impl {hk}")
+    buf = _CAPTURER.device_buffer
+    if _fast_capture() and buf.is_cuda and buf.dtype == torch.uint8 and buf.is_contiguous():
+        # One kernel per layer: gather codes/scales from the paged cache and
+        # write the encode_kv record in place.
+        from nemo_rl.quantization.trace.encode_triton import capture_kv_into
+
+        capture_kv_into(
+            buf, (_NUM_LAYERS + rec.row_offset) * _LAYOUT.topk, kv_cache, slot_mapping,
+            hk, _LAYOUT.head_dim, rec.mode,
+        )
+        return
+    from vllm.utils.torch_utils import nvfp4_split_data_scale
+
     n = slot_mapping.shape[0]
     valid = slot_mapping >= 0
     slots = slot_mapping.clamp(min=0)
