@@ -685,6 +685,17 @@ class BaseVllmGenerationWorker:
         )
         if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
             validate_nvfp4_pertoken_model(hf_config)
+        from nemo_rl.quantization.trace.layout import (
+            layout_for_hf_config,
+            trace_requested,
+        )
+
+        if trace_requested():
+            import nemo_rl.models.generation.vllm.utils as vllm_utils
+
+            vllm_utils.G_TRACE_EXTRA_ROWS = layout_for_hf_config(
+                hf_config.get_text_config()
+            ).extra_rows
         if "GptOssForCausalLM" in getattr(hf_config, "architectures", []):
             if "quantization_config" in hf_config:
                 assert load_format == "dummy", (
@@ -1167,6 +1178,10 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         output_ids_list = []
         logprobs_list = []
         routed_experts_list = []
+        trace_refs: list = []
+        from nemo_rl.models.generation.vllm import utils as _vllm_utils
+
+        trace_enabled = bool(_vllm_utils.G_TRACE_EXTRA_ROWS)
         r3_missing_routes = []
         r3_expected_routes = []
         r3_actual_routes = []
@@ -1247,6 +1262,11 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 r3_actual_routes.append(r3_stats["actual_routes"])
             if full_routed_experts is not None:
                 routed_experts_list.append(full_routed_experts)
+            if trace_enabled:
+                # TRACE payload stays in this node's object store; only the
+                # ref crosses the driver (see trace_probe.attach_trace_rows).
+                trace_np = r3_stats.pop("trace", None) if r3_stats else None
+                trace_refs.append(ray.put(trace_np) if trace_np is not None else None)
 
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
@@ -1295,6 +1315,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         )
         if routed_experts_list:
             return_data["routed_experts"] = torch.stack(routed_experts_list)
+        if trace_enabled:
+            return_data["trace_ref"] = trace_refs
         if r3_missing_routes:
             return_data["r3_routed_experts_missing_routes"] = torch.tensor(
                 r3_missing_routes, dtype=torch.long

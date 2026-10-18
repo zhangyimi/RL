@@ -462,6 +462,14 @@ def build_router_replay_assignments(
     if model_config is None:
         raise ValueError("Could not locate Megatron model config for router replay.")
 
+    from nemo_rl.models.megatron import trace_probe
+
+    # TRACE rows ride on the routed-experts tensor; strip them (pre-SP, so
+    # attention sites keep the full sequence) before routes are consumed.
+    local_routed_experts = trace_probe.split_trace_rows(
+        model, model_config, local_routed_experts, _split_for_sequence_parallel
+    )
+    trace_probe.next_microbatch()
     local_routed_experts = _split_for_sequence_parallel(
         model_config, local_routed_experts
     )

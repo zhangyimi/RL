@@ -15,6 +15,7 @@
 from collections import defaultdict
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 from nemo_rl.data.multimodal_utils import (
@@ -51,6 +52,8 @@ VLLM_LOGPROB_FLOOR = -9999.0
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
+# TRACE payload rows appended after the per-layer routes (raw bytes, not ids).
+G_TRACE_EXTRA_ROWS = 0
 _GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
@@ -255,6 +258,24 @@ def pad_and_align_routed_expert_indices(
     routed = getattr(completion_output, "routed_experts", None)
     prompt_routed = getattr(request_output, "prompt_routed_experts", None)
 
+    # TRACE rows ride on vLLM's routed-experts capture; split them off here,
+    # unpadded and uncast, so only the routes enter the padded batch tensors.
+    trace = None
+    if G_TRACE_EXTRA_ROWS:
+        import numpy as np
+
+        parts = []
+        if prompt_routed is not None:
+            prompt_routed = np.asarray(prompt_routed)
+            parts.append(prompt_routed[:, -G_TRACE_EXTRA_ROWS:])
+            prompt_routed = prompt_routed[:, :-G_TRACE_EXTRA_ROWS]
+        if routed is not None:
+            routed = np.asarray(routed)
+            parts.append(routed[:, -G_TRACE_EXTRA_ROWS:])
+            routed = routed[:, :-G_TRACE_EXTRA_ROWS]
+        if parts:
+            trace = np.concatenate(parts, axis=0).astype(np.uint8, copy=False)
+
     if prompt_routed is not None:
         prompt_routed = _as_routed_experts_tensor(
             prompt_routed, device=device, dtype=routed_experts_dtype
@@ -279,6 +300,8 @@ def pad_and_align_routed_expert_indices(
 
     if routed is None:
         return (None, stats) if return_stats else None
+    if trace is not None:
+        stats["trace"] = np.ascontiguousarray(trace[: min(expected_routes, trace.shape[0])])
     if routed.dim() != 3:
         raise ValueError(
             "vLLM routed_experts must have shape [tokens, num_moe_layers, topk], "

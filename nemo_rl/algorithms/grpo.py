@@ -2423,6 +2423,11 @@ def _preserve_router_replay_routed_experts(
     """Carry rollout-recorded routes into policy worker inputs when R3 is enabled."""
     if router_replay_enabled(policy_config) and "routed_experts" in flat_messages:
         target["routed_experts"] = flat_messages["routed_experts"]
+        if "trace_ref" in flat_messages:
+            # One ref per turn; the last turn's capture covers the full prefix.
+            target["trace_refs"] = [
+                refs[-1] if refs else None for refs in flat_messages["trace_ref"]
+            ]
 
 
 def _policy_dtype(policy_config: PolicyConfig) -> torch.dtype:

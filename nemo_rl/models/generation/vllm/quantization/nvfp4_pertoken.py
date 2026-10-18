@@ -20,9 +20,10 @@ use TE NVFP4 for policy computation, but its master/export weights and the
 refit transport remain BF16.
 """
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
+from types import MappingProxyType, new_class
 from typing import Any, Literal, Optional, cast
 
 import torch
@@ -519,6 +520,32 @@ class NvFp4PerTokenQuantizer:
         )
 
 
+_TRACE_EXPERTS_CLS: dict[type, type] = {}
+
+
+def trace_experts_cls(experts_cls: type) -> type:
+    """Return ``experts_cls`` with TRACE rollout capture mixed in.
+
+    TRACE fc1/fc2 capture rides on the per-token quantize call and the kernel
+    launch; the mixin is a no-op until the capturer registers a layout. The
+    subclass keeps the original name as a suffix because vLLM logs and
+    duck-types on ``type(...).__name__``.
+    """
+    cached = _TRACE_EXPERTS_CLS.get(experts_cls)
+    if cached is None:
+        from nemo_rl.models.generation.vllm.quantization.trace_capture import (
+            TraceFc1CaptureMixin,
+        )
+
+        cached = new_class(
+            f"Trace{experts_cls.__name__}",
+            (TraceFc1CaptureMixin, experts_cls),
+            exec_body=lambda namespace: namespace.update(__module__=__name__),
+        )
+        _TRACE_EXPERTS_CLS[experts_cls] = cached
+    return cached
+
+
 class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
     """W4A4 MoE: pre-quantized weights, per-token dynamic activation scales.
 
@@ -553,6 +580,17 @@ class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
             )
         # Router replay keeps vLLM's in-kernel capture: its layer-owned
         # RoutedExpertsSink survives the per-refit kernel rebuild below.
+        from nemo_rl.quantization.trace.layout import trace_requested
+
+        if trace_requested():
+            assert self.experts_cls is not None
+            self.experts_cls = trace_experts_cls(self.experts_cls)
+        if os.environ.get("NRL_TRACE_FC2_LAYERS"):
+            # Runs in the vLLM worker process during model construction, i.e.
+            # before FlashInfer loads its MoE module for the profile run.
+            from nemo_rl.models.generation.vllm.quantization import trace_fi_fc2
+
+            trace_fi_fc2.install()
 
     def process_weights_after_loading(self, layer) -> None:
         """Finalize reload-format weights for dynamic per-token activation FP4.

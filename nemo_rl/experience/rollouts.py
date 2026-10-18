@@ -650,6 +650,9 @@ def generate_responses(
             assistant_message["routed_experts"] = routed_experts[
                 input_length:total_length
             ]
+        if "trace_ref" in generation_outputs:
+            # Covers the whole prompt+response prefix of this turn (TRACE).
+            assistant_message["trace_ref"] = generation_outputs["trace_ref"][i]
 
         batch["message_log"][i].append(assistant_message)
 
@@ -791,6 +794,9 @@ async def generate_responses_async(
             assistant_message["routed_experts"] = routed_experts[
                 input_length:total_length
             ]
+        if "trace_ref" in generation_outputs:
+            # Covers the whole prompt+response prefix of this turn (TRACE).
+            assistant_message["trace_ref"] = generation_outputs["trace_ref"][i]
 
         batch["message_log"][i].append(assistant_message)
 

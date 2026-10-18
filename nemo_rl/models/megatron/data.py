@@ -258,6 +258,11 @@ def make_processed_microbatch_iterator(
                 context_parallel_size=get_context_parallel_world_size(),
             )
 
+        if "trace_refs" in data_dict:
+            from nemo_rl.models.megatron.trace_probe import attach_trace_rows
+
+            attach_trace_rows(data_dict)
+
         # Move to GPU
         data_dict = data_dict.to("cuda")
 

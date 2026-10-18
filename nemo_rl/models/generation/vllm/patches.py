@@ -933,3 +933,8 @@ def _apply_vllm_patches(
             "could not be applied. Disable the flag or update the patch anchors "
             "for this vLLM version."
         )
+    from nemo_rl.models.generation.vllm.quantization.trace_capture import (
+        apply_trace_capture_patches,
+    )
+
+    apply_trace_capture_patches(patch_logger)
