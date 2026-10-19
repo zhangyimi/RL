@@ -540,12 +540,15 @@ def _install_attention_apply_hooks(model: Any) -> None:
                 return _apply_attention_quant(layer, args, kwargs)
 
             module.core_attention.register_forward_pre_hook(pre, with_kwargs=True)
-            if "o8" in os.environ.get(APPLY_ENV, "").split(","):
-                # Rollout attention writes its output through an FP8 buffer.
-                def post(mod, args, output):
+            omodes = os.environ.get(APPLY_ENV, "").split(",")
+            if "o8" in omodes or "o8s" in omodes:
+                # Rollout attention writes its output through an FP8 buffer,
+                # unscaled (o8) or scaled by v_scale (o8s, NRL_TRACE_KV_OSCALE=1).
+                def post(mod, args, output, layer=layer, scaled="o8s" in omodes):
+                    s = _kv_scales().get(layer, {}).get("v", 1.0) if scaled else 1.0
                     if isinstance(output, tuple):
-                        return (_fp8_fake(output[0], 1.0), *output[1:])
-                    return _fp8_fake(output, 1.0)
+                        return (_fp8_fake(output[0], s), *output[1:])
+                    return _fp8_fake(output, s)
 
                 module.core_attention.register_forward_hook(post)
             n += 1
@@ -875,6 +878,7 @@ def _probe_kv(layer: int, key: torch.Tensor, value: torch.Tensor) -> None:
         _emit(rec)
         return
     scales = _kv_scales().get(layer, {})
+    tok = {"valid": v.cpu()}
     for name, x, sf, codes in (
         ("k", k, dec.k_scale, dec.k_codes),
         ("v", vv, dec.v_scale, dec.v_codes),
@@ -888,6 +892,13 @@ def _probe_kv(layer: int, key: torch.Tensor, value: torch.Tensor) -> None:
         )
         rtn = _kv_codes_under_scale(x, sf, gscale)
         rec[f"{name}_rtn_roll_scale"] = _code_stats(rtn, roll)
+        if os.environ.get("NRL_TRACE_KV_TOKSTATS") and _rank() == 0:
+            # Per-token agreement (analysis): is divergence spread or concentrated?
+            si = [torch.where((c & 8) != 0, -_mag_index(c), _mag_index(c)).to(torch.int32) for c in (rtn, roll)]
+            dist = (si[0] - si[1]).abs()
+            tok[f"{name}_mis"] = (dist > 0).float().mean((1, 2)).cpu()
+            tok[f"{name}_off2"] = (dist > 1).float().mean((1, 2)).cpu()
+            tok[f"{name}_absmean"] = x.float().abs().mean((1, 2)).cpu()
         n, h, dd = x.shape
         scale = sf.to(torch.float32).view(n, h, dd // 16, 1) * gscale
         enc = torch.where(scale == 0, torch.zeros_like(scale), 1.0 / scale)
@@ -897,6 +908,10 @@ def _probe_kv(layer: int, key: torch.Tensor, value: torch.Tensor) -> None:
         qr = _dequant(roll)
         rec[f"{name}_d_act_rtn"] = float((_dequant(rtn) - qr).norm() / qr.norm().clamp_min(1e-30))
         rec[f"{name}_d_act_trace"] = float((_dequant(g) - qr).norm() / qr.norm().clamp_min(1e-30))
+    if len(tok) > 1:
+        d = os.path.join(os.environ[PROBE_DIR_ENV], "tokstats")
+        os.makedirs(d, exist_ok=True)
+        torch.save(tok, os.path.join(d, f"L{layer}_call{_CALL}.pt"))
     _maybe_save(f"kv_L{layer}_call{_CALL}", {"k": k[v][:64], "v": vv[v][:64],
                                             "k_sf": dec.k_scale[v][:64].view(torch.uint8),
                                             "k_codes": dec.k_codes[v][:64],

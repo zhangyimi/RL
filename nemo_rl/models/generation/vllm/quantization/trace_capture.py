@@ -321,6 +321,8 @@ _SHAPE_MARKER = "NeMo-RL patch (TRACE routed-experts extra rows)"
 _INIT_MARKER = "NeMo-RL patch (TRACE capturer registration)"
 _BIND_MARKER = "NeMo-RL patch (TRACE bind hook)"
 _KV_MARKER = "NeMo-RL patch (TRACE kv capture)"
+_OSCALE_MARKER = "NeMo-RL patch (NVFP4 KV fp8 output scale)"
+KV_OSCALE_ENV = "NRL_TRACE_KV_OSCALE"
 
 
 def _patch_routed_experts_capturer(logger) -> None:
@@ -417,6 +419,55 @@ def _patch_flashinfer_kv_update(logger) -> None:
     logger.info("Patched flashinfer.py do_kv_cache_update for TRACE kv capture.")
 
 
+def _patch_flashinfer_out_scale(logger) -> None:
+    """Give the NVFP4-KV attention output a scale.
+
+    With an NVFP4 KV cache trtllm-gen only writes FP8 output, and vLLM stores
+    it unscaled (``bmm2_scale = v_scale``) before casting back to BF16. Qwen3's
+    attention outputs are mostly < 2^-6, i.e. FP8 subnormals (up to ~27%
+    error). The output is a convex combination of V rows, so ``|O| <= 448 *
+    v_scale``: use ``v_scale`` as the output scale and multiply it back.
+    """
+    from nemo_rl.models.generation.vllm.patches import _get_vllm_file, _locked_file_patch
+
+    path = _get_vllm_file("v1/attention/backends/flashinfer.py")
+    os_expr = "getattr(self, '_nrl_os', 1.0)"
+    init_old = (
+        "            if is_quantized_kv_cache(self.kv_cache_dtype):\n"
+        "                self.bmm2_scale *= layer._v_scale_float\n"
+    )
+    init_new = (
+        init_old
+        + f"            # {_OSCALE_MARKER}\n"
+        "            if self.is_kvcache_nvfp4:\n"
+        "                self._nrl_os = layer._v_scale_float\n"
+        "                self.bmm2_scale /= self._nrl_os\n"
+    )
+    copies = [
+        ("].copy_(out_prefill.to(output.dtype))", f"].copy_(out_prefill.to(output.dtype) * {os_expr})", 1),
+        ("].copy_(out[:num_prefill_tokens].to(output.dtype))",
+         f"].copy_(out[:num_prefill_tokens].to(output.dtype) * {os_expr})", 1),
+        ("output[:num_decode_tokens].copy_(out_decode.to(output.dtype))",
+         f"output[:num_decode_tokens].copy_(out_decode.to(output.dtype) * {os_expr})", 1),
+        ("output[:num_decode_tokens].copy_(out.to(output.dtype))",
+         f"output[:num_decode_tokens].copy_(out.to(output.dtype) * {os_expr})", 1),
+        # FlashInfer wrapper paths take v_scale directly instead of bmm2_scale.
+        ("v_scale=layer._v_scale_float,", f"v_scale=layer._v_scale_float / {os_expr},", 5),
+    ]
+    with _locked_file_patch(path) as (content, write_back):
+        if _OSCALE_MARKER in content:
+            return
+        if content.count(init_old) != 1:
+            raise RuntimeError(f"NVFP4 out-scale anchor not found exactly once in {path}")
+        content = content.replace(init_old, init_new, 1)
+        for old, new, n in copies:
+            if content.count(old) != n:
+                raise RuntimeError(f"NVFP4 out-scale anchor {old!r} found {content.count(old)}x (want {n}) in {path}")
+            content = content.replace(old, new)
+        write_back(content)
+    logger.info("Patched flashinfer.py: scaled FP8 attention output for NVFP4 KV.")
+
+
 def apply_trace_capture_patches(logger) -> None:
     """Install the source patches when ``NRL_TRACE_*`` requests capture."""
     if not trace_layout.trace_requested():
@@ -424,3 +475,5 @@ def apply_trace_capture_patches(logger) -> None:
     _patch_routed_experts_capturer(logger)
     if os.environ.get(trace_layout.KV_LAYERS_ENV):
         _patch_flashinfer_kv_update(logger)
+    if os.environ.get(KV_OSCALE_ENV) == "1":
+        _patch_flashinfer_out_scale(logger)
