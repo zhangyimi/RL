@@ -23,11 +23,12 @@ Hooks (installed by :func:`apply_trace_capture_patches`):
 * ``_get_routed_experts_shape``: widened by the layout's extra rows, in every
   process that sizes a routed-experts buffer (worker and scheduler).
 * ``RoutedExpertsCapturer.__init__``: registers the capturer here and wraps
-  ``capture`` to remember which MoE layer is running. NeMo-RL's monolithic
-  patch fires the router capture right before ``forward_monolithic``, so the
-  fc1 hook that follows knows its layer without touching vLLM's layer plumbing.
-* fc1: ``_TraceFc1CaptureMixin._quantize_per_token_input`` on NeMo-RL's
-  per-token experts class (no vLLM source patch).
+  ``MoERunner._forward_impl`` to remember which MoE layer is running. The
+  in-kernel routed-experts capture fires only after the kernel, so it cannot
+  tell the fc1/fc2 hooks inside the kernel call which layer they belong to.
+* fc1: vLLM's ``quantize_nvfp4_per_token_input`` as bound in the TRT-LLM
+  NVFP4 experts module (no vLLM source patch).
+* fc2: ``TraceFc1CaptureMixin.apply`` on NeMo-RL's per-token experts class.
 * kv: ``FlashInferImpl.do_kv_cache_update`` reads the just-written NVFP4 cache
   slots back (the cache itself is the ground truth for what attention reads).
 
@@ -78,19 +79,55 @@ def register_capturer(capturer: Any, vllm_config: Any) -> None:
         if capturer.device_buffer.dtype != torch.uint8 or not capturer.device_buffer.is_contiguous():
             raise RuntimeError("TRACE fc2 capture writes records into a contiguous uint8 transit buffer")
 
-    orig_capture = capturer.capture
-
-    def capture(layer_id: int, topk_ids: torch.Tensor) -> None:
-        global _CURRENT_MOE_LAYER
-        _CURRENT_MOE_LAYER = int(layer_id)
-        orig_capture(layer_id, topk_ids)
-
-    capturer.capture = capture
+    _install_layer_tracking()
+    _install_fc1_capture()
     print(
         f"[trace] rollout capture active: layout={layout.to_json()} "
         f"extra_rows={layout.extra_rows}",
         flush=True,
     )
+
+
+def _install_layer_tracking() -> None:
+    """Record the running MoE layer around each runner call.
+
+    ``_forward_impl`` runs eagerly inside the opaque ``moe_forward`` custom op,
+    so under CUDA-graph capture this host code runs once per captured layer and
+    the per-layer record offsets are baked into the graph.
+    """
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    if getattr(MoERunner, "_nrl_trace_layer", False):
+        return
+    orig = MoERunner._forward_impl
+
+    def _forward_impl(self, *args, **kwargs):
+        global _CURRENT_MOE_LAYER
+        _CURRENT_MOE_LAYER = int(self.layer_id)
+        try:
+            return orig(self, *args, **kwargs)
+        finally:
+            _CURRENT_MOE_LAYER = None
+
+    MoERunner._forward_impl = _forward_impl
+    MoERunner._nrl_trace_layer = True
+
+
+def _install_fc1_capture() -> None:
+    """Capture fc1 codes from the per-token input quantize of the TRT-LLM experts."""
+    from vllm.model_executor.layers.fused_moe.experts import trtllm_nvfp4_moe
+
+    orig = trtllm_nvfp4_moe.quantize_nvfp4_per_token_input
+    if getattr(orig, "_nrl_trace", False):
+        return
+
+    def quantize_nvfp4_per_token_input(hidden_states: torch.Tensor):
+        out = orig(hidden_states)
+        capture_fc1(*out)
+        return out
+
+    quantize_nvfp4_per_token_input._nrl_trace = True  # type: ignore[attr-defined]
+    trtllm_nvfp4_moe.quantize_nvfp4_per_token_input = quantize_nvfp4_per_token_input
 
 
 def _write(rec: trace_layout.SiteRecord, payload: torch.Tensor) -> None:
@@ -164,12 +201,7 @@ def _install_dbg_capture() -> None:
 
 
 class TraceFc1CaptureMixin:
-    """Mixed into NeMo-RL's per-token TRT-LLM experts class (fc1 and fc2)."""
-
-    def _quantize_per_token_input(self, hidden_states: torch.Tensor):
-        out = super()._quantize_per_token_input(hidden_states)  # type: ignore[misc]
-        capture_fc1(*out)
-        return out
+    """Mixed into NeMo-RL's per-token TRT-LLM experts class (fc2 capture)."""
 
     def apply(self, hidden_states: torch.Tensor, *args, **kwargs):
         rec = None
@@ -187,6 +219,7 @@ class TraceFc1CaptureMixin:
             byte_offset=(_NUM_LAYERS + rec.row_offset) * _LAYOUT.topk,
             row_stride=buf.shape[1] * buf.shape[2],
             bits=_LAYOUT.fc2_bits,
+            record_width=_LAYOUT.moe_intermediate_size,
         )
         try:
             out = super().apply(hidden_states, *args, **kwargs)  # type: ignore[misc]
@@ -336,10 +369,7 @@ def _patch_routed_experts_capturer(logger) -> None:
         "    from nemo_rl.quantization.trace.layout import extra_rows_for_vllm_config\n"
         "    num_layers += extra_rows_for_vllm_config(vllm_config)\n"
     )
-    init_old = (
-        "        # KV cache group whose slot layout the routing data is keyed by.\n"
-        "        self.attn_gid = get_routed_experts_attn_gid(kv_cache_config)\n"
-    )
+    init_old = "        self.tp_size = vllm_config.parallel_config.tensor_parallel_size\n"
     init_new = (
         init_old
         + f"        # {_INIT_MARKER}\n"

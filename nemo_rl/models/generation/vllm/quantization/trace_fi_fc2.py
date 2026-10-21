@@ -47,20 +47,22 @@ namespace nrl_trace {
 uint8_t* g_fc2_out = nullptr;  // record base (transit buffer + byte offset)
 int64_t g_fc2_row_stride = 0;  // bytes between consecutive tokens' records
 int g_fc2_bits = 1;            // 1: mantissa bit, 2: two low bits, 4: full code
+int32_t g_fc2_width = 0;       // record elements per slot (unpadded intermediate)
 
 // One block per expanded index e = token * topk + k. Row p of the permuted FP4
 // activation holds n/2 bytes (element 2i in the low nibble). The record of a
-// token is [marker x4 | slot k=0 | ... | slot k=topk-1], each slot n*bits/8
-// bytes; element i sits at bit (i*bits)%8 of byte (i*bits)/8. Non-local
-// experts (p < 0) get zeros.
-__global__ void fc2CaptureKernel(int32_t numExpanded, int32_t topk, int32_t n, int bits,
-                                 int64_t rowStride, int32_t const* e2p,
+// token is [marker x4 | slot k=0 | ... | slot k=topk-1], each slot w*bits/8
+// bytes for the first w <= n elements (n may carry kernel alignment padding);
+// element i sits at bit (i*bits)%8 of byte (i*bits)/8. Non-local experts
+// (p < 0) get zeros.
+__global__ void fc2CaptureKernel(int32_t numExpanded, int32_t topk, int32_t n, int32_t w,
+                                 int bits, int64_t rowStride, int32_t const* e2p,
                                  uint8_t const* act, uint8_t* out) {
   int32_t e = blockIdx.x;
   if (e >= numExpanded) return;
   int32_t tok = e / topk, k = e % topk;
   int32_t p = e2p[e];
-  int32_t nb = n * bits / 8;
+  int32_t nb = w * bits / 8;
   uint8_t* rec = out + int64_t(tok) * rowStride;
   if (k == 0 && threadIdx.x < 4) rec[threadIdx.x] = 0xA5;
   uint8_t* dst = rec + 4 + int64_t(k) * nb;
@@ -85,10 +87,11 @@ __global__ void fc2CaptureKernel(int32_t numExpanded, int32_t topk, int32_t n, i
 }
 }  // namespace nrl_trace
 
-extern "C" void nrl_trace_set_fc2_out(void* p, int64_t stride, int bits) {
+extern "C" void nrl_trace_set_fc2_out(void* p, int64_t stride, int bits, int32_t width) {
   nrl_trace::g_fc2_out = static_cast<uint8_t*>(p);
   nrl_trace::g_fc2_row_stride = stride;
   nrl_trace::g_fc2_bits = bits;
+  nrl_trace::g_fc2_width = width;
 }
 // ---------------------------------------------------------------------------
 '''
@@ -104,8 +107,12 @@ _RUNNER_CAPTURE = r'''
   // NeMo-RL TRACE: capture fc2 input code bits (per-token NVFP4 path only).
   if (mUsePerTokenScalingGemm2 && ::nrl_trace::g_fc2_out != nullptr) {
     int32_t numExpanded = args.num_tokens * totalExpertsPerToken;
+    int32_t width = ::nrl_trace::g_fc2_width;
+    FLASHINFER_CHECK(width > 0 && width <= args.intermediate_size,
+                     "TRACE fc2 record width ", width, " exceeds intermediate size ",
+                     args.intermediate_size);
     ::nrl_trace::fc2CaptureKernel<<<numExpanded, 128, 0, stream>>>(
-        numExpanded, totalExpertsPerToken, args.intermediate_size, ::nrl_trace::g_fc2_bits,
+        numExpanded, totalExpertsPerToken, args.intermediate_size, width, ::nrl_trace::g_fc2_bits,
         ::nrl_trace::g_fc2_row_stride,
         reinterpret_cast<int32_t const*>(workspace.expanded_idx_to_permuted_idx),
         reinterpret_cast<uint8_t const*>(workspace.activation_output),
@@ -114,12 +121,12 @@ _RUNNER_CAPTURE = r'''
 '''
 _LAUNCHER_TAIL_ANCHOR = "}  // namespace flashinfer\n"
 _LAUNCHER_EXPORT = r'''
-extern "C" void nrl_trace_set_fc2_out(void* p, int64_t stride, int bits);
+extern "C" void nrl_trace_set_fc2_out(void* p, int64_t stride, int bits, int32_t width);
 void nrl_trace_set_fc2_out_ffi(Optional<TensorView> buf, int64_t byte_offset, int64_t row_stride,
-                               int64_t bits) {
+                               int64_t bits, int64_t width) {
   nrl_trace_set_fc2_out(
       buf.has_value() ? static_cast<uint8_t*>(buf.value().data_ptr()) + byte_offset : nullptr,
-      row_stride, static_cast<int>(bits));
+      row_stride, static_cast<int>(bits), static_cast<int32_t>(width));
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nrl_trace_set_fc2_out, nrl_trace_set_fc2_out_ffi);
 
@@ -203,15 +210,24 @@ def install() -> None:
     print("[trace] FlashInfer TRT-LLM MoE routed through the fc2-capture overlay", flush=True)
 
 
-def set_fc2_out(buf: Optional[Any], byte_offset: int = 0, row_stride: int = 0, bits: int = 1) -> None:
+def set_fc2_out(
+    buf: Optional[Any],
+    byte_offset: int = 0,
+    row_stride: int = 0,
+    bits: int = 1,
+    record_width: int = 0,
+) -> None:
     """Make the next MoE kernel launches write fc2 records into ``buf`` (or stop: None).
 
     ``buf`` is the contiguous uint8 transit buffer; token ``t``'s record starts
     at byte ``byte_offset + t * row_stride``: ``[marker x4 | topk slots of
-    I*bits/8 bytes]`` (``layout.encode_fc2`` format).
+    I*bits/8 bytes]`` (``layout.encode_fc2`` format), where ``I`` is
+    ``record_width``: the model's intermediate size, which the kernel may pad.
     """
     if _MODULE is None:
         if buf is None:
             return
         raise RuntimeError("TRACE fc2 overlay module is not loaded yet")
-    _MODULE.nrl_trace_set_fc2_out(buf, int(byte_offset), int(row_stride), int(bits))
+    _MODULE.nrl_trace_set_fc2_out(
+        buf, int(byte_offset), int(row_stride), int(bits), int(record_width)
+    )

@@ -1267,6 +1267,12 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 # ref crosses the driver (see trace_probe.attach_trace_rows).
                 trace_np = r3_stats.pop("trace", None) if r3_stats else None
                 trace_refs.append(ray.put(trace_np) if trace_np is not None else None)
+                # vLLM's capture arrays carry the full TRACE rows; drop them
+                # now rather than holding every request's copy until the
+                # batch is assembled.
+                del trace_np
+                generation.routed_experts = None
+                output.prompt_routed_experts = None
 
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
