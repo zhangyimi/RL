@@ -79,6 +79,6 @@ Adding `kv` to `sites` switches the rollout to an NVFP4 KV cache (`kv_cache_dtyp
 
 ## Limitations
 
-- Up to about 0.1% of elements still disagree after guidance. Almost all of them are two codes apart: the rollout value lies outside the two neighbors of the training value, so one bit cannot recover it.
+- Some elements still disagree after guidance, and the share grows with depth as the two forwards drift apart (Qwen3-30B-A3B, `fc1`: 0.02% at layer 4, about 4% at layer 40; much more with the NVFP4 KV cache). Almost all of them are two codes apart: the rollout value lies outside the two neighbors of the training value, so one bit cannot recover it.
 - The rollout-side hooks patch vLLM and FlashInfer sources at fixed anchors. They are validated on the pinned vLLM nightly and FlashInfer 0.7, and fail loudly on a version they do not match.
 - The async vLLM engine and SingleController are not supported yet.
