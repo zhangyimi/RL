@@ -333,6 +333,7 @@ model-quirks.md
 guides/async-grpo.md
 guides/single-controller.md
 guides/quantization-aware-rl.md
+guides/trace-nvfp4.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md

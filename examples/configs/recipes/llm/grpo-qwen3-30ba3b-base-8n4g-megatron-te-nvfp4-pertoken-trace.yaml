@@ -2,7 +2,13 @@ defaults: grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken.yaml
 # TRACE (arXiv 2610.07767): the rollout records the mantissa bit of every
 # routed-expert fc1/fc2 input FP4 code and the training forward rounds toward
 # it instead of round-to-nearest. Requires router replay and vLLM TP=1.
+# Matches the 400-step comparison runs in docs/guides/trace-nvfp4.md.
+grpo:
+  max_num_steps: 400
+  val_period: 20
 policy:
+  megatron_cfg:
+    first_last_layers_bf16: false
   generation:
     nvfp4_pertoken_rollout:
       trace:
@@ -13,7 +19,11 @@ policy:
       # Router replay on the pinned vLLM nightly needs synchronous scheduling
       # (same as the Nemotron 3.5 recipe).
       async_scheduling: false
+      # Caps the KV block pool (peak use is ~10%) and with it the host-side
+      # routed-experts store, which carries the TRACE payload per cached token.
+      num_gpu_blocks_override: 16000
 checkpointing:
+  save_period: 20
   checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace
