@@ -9,7 +9,7 @@ TRACE ([arXiv 2610.07767](https://arxiv.org/abs/2610.07767)) reduces the mismatc
 - The quantization points are the inputs of the two routed-expert GEMMs (`fc1`, `fc2`) and, optionally, the NVFP4 KV cache (`kv`).
 - The record travels with the router-replay routes, so it follows the same padding, packing and parallel sharding.
 
-**Difference from the paper:** the paper also stores the rollout's quantization scales, and uses them both to pick the code and to dequantize it. Here only the bits are sent. Training quantizes with Transformer Engine, which computes its own scales, so only the rounding direction is matched.
+**Difference from the paper: scales are not sent.** The paper trains with fake quantization (QAT), so it can also store the rollout's quantization scales and use them to pick and to dequantize each code. Here training runs the real Transformer Engine NVFP4 kernels, which compute their own scales and do not take external ones. Only the bits are sent, so only the rounding direction is matched. Using the rollout's scales would need fake-quant training, or a TE path that accepts pre-quantized inputs.
 
 ## Requirements
 
@@ -66,7 +66,7 @@ TRACE brings the mismatch close to BF16. In these runs, validation accuracy did 
 
 Adding `kv` to `sites` switches the rollout to an NVFP4 KV cache (`kv_cache_dtype: nvfp4`). Training then applies the same NVFP4 quantization to K and V before attention.
 
-- **Calibrated scales are required.** With vLLM's default scale of 1.0, small V values underflow and the rollout degrades badly. To calibrate, run a short BF16-KV job with `trace.kv.calib_dir: <dir>`, merge the per-rank maxima, and point `trace.kv.scales_file` at the result:
+- **The KV scale is per tensor, so it must be calibrated in advance.** Activations get a scale per token at run time, but the NVFP4 KV cache uses one fixed scale per layer for K and one for V (plus the usual 16-element block scales). With vLLM's default of 1.0, small V values underflow and the rollout degrades badly. To calibrate, run a short BF16-KV job with `trace.kv.calib_dir: <dir>`, merge the per-rank maxima, and point `trace.kv.scales_file` at the result:
 
   ```sh
   python -m nemo_rl.quantization.trace.kv_calib <dir> kv_amax.json
@@ -75,6 +75,7 @@ Adding `kv` to `sites` switches the rollout to an NVFP4 KV cache (`kv_cache_dtyp
   Scales for Qwen3-30B-A3B-Base are in `examples/trace/kv_amax_qwen3_30b_a3b_base.json`.
 - The trtllm-gen attention kernel dequantizes the NVFP4 cache to FP8 and quantizes Q to FP8. Training mirrors the FP8 dequantization, but these FP8 steps leave an error floor that TRACE does not remove.
 - `trace.kv.mode: rtn` applies plain round-to-nearest NVFP4 to K/V in training instead (a quantization-aware-training baseline).
+- Per-token KV scales are not supported. They would need vLLM to store a scale per token in the cache, the attention kernel to read it, and training to mirror it.
 - KV support is validated on Qwen3-30B-A3B only.
 
 ## Limitations
