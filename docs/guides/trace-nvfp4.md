@@ -7,7 +7,6 @@ TRACE ([arXiv 2610.07767](https://arxiv.org/abs/2610.07767)) reduces the mismatc
 - During generation, vLLM records the lowest bit of every FP4 activation code at the selected quantization points. Neighboring FP4 values alternate this bit, so it tells which of the two nearest FP4 values the rollout rounded to.
 - In the training forward, Megatron rounds the same element to the neighbor with that bit instead of rounding to nearest. Gradients pass straight through.
 - The quantization points are the inputs of the two routed-expert GEMMs (`fc1`, `fc2`) and, optionally, the NVFP4 KV cache (`kv`).
-- The record travels with the router-replay routes, so it follows the same padding, packing and parallel sharding.
 
 **Difference from the paper: scales are not sent.** The paper trains with fake quantization (QAT), so it can also store the rollout's quantization scales and use them to pick and to dequantize each code. Here training runs the real Transformer Engine NVFP4 kernels, which compute their own scales and do not take external ones. Only the bits are sent, so only the rounding direction is matched. Using the rollout's scales would need fake-quant training, or a TE path that accepts pre-quantized inputs.
 
@@ -39,7 +38,7 @@ Ready-made recipes:
 - `examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace.yaml`
 - `examples/configs/recipes/llm/grpo-nemotron35-lightning-30ba3b-8n4g-megatron-te-nvfp4-pertoken-trace.yaml`
 
-The Qwen3 recipe matches the 400-step runs below: every MoE layer in NVFP4, validation every 20 steps, and `num_gpu_blocks_override: 16000`. The block cap bounds the host memory that vLLM uses to keep routed-expert records for cached tokens, and it does not change numerics.
+The Qwen3 recipe already has the settings of the 400-step runs below: 400 steps, every MoE layer in NVFP4, validation every 20 steps, synchronous vLLM scheduling, and `num_gpu_blocks_override: 16000` (caps the host memory vLLM uses for routing records; no effect on numerics).
 
 The recipes need 8 nodes × 4 GPUs; see [Set Up Clusters](../cluster.md) for launching on Slurm. Run TRACE on `fc1` and `fc2`:
 
@@ -57,7 +56,7 @@ uv run examples/run_grpo.py \
   ++policy.generation.nvfp4_pertoken_rollout.trace.kv.scales_file=examples/trace/kv_amax_qwen3_30b_a3b_base.json
 ```
 
-For the plain NVFP4 baseline, run the parent recipe with the same overrides:
+For the plain NVFP4 baseline, run the parent recipe. It does not have these settings, so pass them on the command line:
 
 ```sh
 uv run examples/run_grpo.py \
@@ -77,6 +76,8 @@ Qwen3-30B-A3B-Base, GRPO on DAPO-Math-17K, 8 nodes × 4 GB200, 400 steps, one ru
 | BF16 | 0.0004 | 0.348 | 0.426 |
 | NVFP4 W4A4 | 0.0058 | 0.336 | 0.398 |
 | NVFP4 W4A4 + TRACE 1-bit | 0.0010 | 0.164 | 0.332 |
+| NVFP4 W4A4 + NVFP4 KV, KV RTN in training | 0.0166 | 0.324 | 0.309 |
+| NVFP4 W4A4 + NVFP4 KV + TRACE 1-bit (incl. KV) | 0.0067 | 0.273 | 0.344 |
 
 TRACE brings the mismatch close to BF16. In these runs, validation accuracy did not improve: it trailed plain NVFP4 for most of the run.
 
