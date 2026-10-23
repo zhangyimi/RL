@@ -9,6 +9,10 @@ policy:
         enabled: true
         sites: [fc1, fc2]
         bits: 1
+    vllm_kwargs:
+      # Router replay on the pinned vLLM nightly needs synchronous scheduling
+      # (same as the Nemotron 3.5 recipe).
+      async_scheduling: false
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace
 logger:

@@ -448,8 +448,12 @@ def _apply_trace_config(
                 "nvfp4_pertoken_rollout.trace rides on router replay; set "
                 "policy.router_replay.enabled=true"
             )
+        vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
+        # Router replay's aux output on the pinned vLLM nightly asserts when
+        # the post-refit prefix-cache reset meets an in-flight async step.
+        vllm_kwargs.setdefault("async_scheduling", False)
         if "kv" in trace.sites:
-            generation_config.setdefault("vllm_kwargs", {})["kv_cache_dtype"] = "nvfp4"
+            vllm_kwargs["kv_cache_dtype"] = "nvfp4"
     megatron_cfg = cast(dict[str, Any], policy_config["megatron_cfg"])
     for cfg in (vllm_cfg, megatron_cfg):
         env_vars = cfg.get("env_vars") or {}
