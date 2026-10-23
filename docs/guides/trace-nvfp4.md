@@ -40,7 +40,7 @@ Ready-made recipes:
 
 The Qwen3 recipe already has the settings of the 400-step runs below: 400 steps, every MoE layer in NVFP4, validation every 20 steps, synchronous vLLM scheduling, and `num_gpu_blocks_override: 16000` (caps the host memory vLLM uses for routing records; no effect on numerics).
 
-The recipes need 8 nodes × 4 GPUs; see [Set Up Clusters](../cluster.md) for launching on Slurm. Run TRACE on `fc1` and `fc2`:
+Run TRACE on `fc1` and `fc2`:
 
 ```sh
 uv run examples/run_grpo.py \
