@@ -39,7 +39,25 @@ Ready-made recipes:
 - `examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace.yaml`
 - `examples/configs/recipes/llm/grpo-nemotron35-lightning-30ba3b-8n4g-megatron-te-nvfp4-pertoken-trace.yaml`
 
-The Qwen3 recipe matches the 400-step runs below: every MoE layer in NVFP4, validation every 20 steps, and `num_gpu_blocks_override: 16000`. The block cap bounds the host memory that vLLM uses to keep routed-expert records for cached tokens, and it does not change numerics. For the plain NVFP4 baseline, run the parent recipe with the same overrides:
+The Qwen3 recipe matches the 400-step runs below: every MoE layer in NVFP4, validation every 20 steps, and `num_gpu_blocks_override: 16000`. The block cap bounds the host memory that vLLM uses to keep routed-expert records for cached tokens, and it does not change numerics.
+
+The recipes need 8 nodes × 4 GPUs; see [Set Up Clusters](../cluster.md) for launching on Slurm. Run TRACE on `fc1` and `fc2`:
+
+```sh
+uv run examples/run_grpo.py \
+  --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace.yaml
+```
+
+Add the NVFP4 KV cache with the bundled Qwen3 scales:
+
+```sh
+uv run examples/run_grpo.py \
+  --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace.yaml \
+  "policy.generation.nvfp4_pertoken_rollout.trace.sites=[fc1,fc2,kv]" \
+  ++policy.generation.nvfp4_pertoken_rollout.trace.kv.scales_file=examples/trace/kv_amax_qwen3_30b_a3b_base.json
+```
+
+For the plain NVFP4 baseline, run the parent recipe with the same overrides:
 
 ```sh
 uv run examples/run_grpo.py \
