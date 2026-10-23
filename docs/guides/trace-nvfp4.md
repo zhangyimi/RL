@@ -1,6 +1,6 @@
 # TRACE: Rollout-Guided NVFP4 Rounding
 
-TRACE ([arXiv 2610.07767](https://arxiv.org/abs/2610.07767)) reduces the mismatch between the NVFP4 rollout and the NVFP4 training forward of MoE models. It builds on the per-token NVFP4 path described in [End-to-End NVFP4 Training](../design-docs/te-nvfp4-per-token-rollout.md).
+TRACE ([arXiv 2610.07767](https://arxiv.org/abs/2610.07767)) reduces the mismatch between the NVFP4 rollout and the NVFP4 training forward of MoE models.
 
 ## How It Works
 
@@ -31,14 +31,12 @@ policy:
         layers: all         # or a list of decoder-layer indices
 ```
 
-`layers: all` selects every NVFP4 routed-expert layer (and every attention layer for `kv`), read from the Hugging Face config. Layers kept in BF16 by `first_last_layers_bf16` are skipped.
-
 Ready-made recipes:
 
 - `examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace.yaml`
 - `examples/configs/recipes/llm/grpo-nemotron35-lightning-30ba3b-8n4g-megatron-te-nvfp4-pertoken-trace.yaml`
 
-The Qwen3 recipe already has the settings of the 400-step runs below: 400 steps, every MoE layer in NVFP4, validation every 20 steps, synchronous vLLM scheduling, and `num_gpu_blocks_override: 16000` (caps the host memory vLLM uses for routing records; no effect on numerics).
+The Qwen3 recipe already has the settings of the 400-step runs below: 400 steps, every MoE layer in NVFP4, validation every 20 steps, synchronous vLLM scheduling, and `num_gpu_blocks_override: 16000` (only limits memory).
 
 Run TRACE on `fc1` and `fc2`:
 
@@ -69,9 +67,12 @@ uv run examples/run_grpo.py \
 
 ## Results
 
-Qwen3-30B-A3B-Base, GRPO on DAPO-Math-17K, 8 nodes × 4 GB200, 400 steps, one run per row. The mismatch KL is `train/gen_kl_error`, the median over steps 380–400.
+Qwen3-30B-A3B-Base, GRPO on DAPO-Math-17K, 8 nodes × 4 GB200, 400 steps, one run per row.
 
-| Rollout / training precision | Mismatch KL | AIME24 @ 200 | AIME24 @ 400 |
+- **Mismatch KL**: KL between the rollout and training log-probs of the generated tokens (`train/gen_kl_error`), median over steps 380–400. Lower means rollout and training agree better.
+- **AIME24**: validation accuracy at step 200 and at step 400.
+
+| Rollout / training precision | Mismatch KL (steps 380–400) | AIME24, step 200 | AIME24, step 400 |
 |---|---|---|---|
 | BF16 | 0.0004 | 0.348 | 0.426 |
 | NVFP4 W4A4 | 0.0058 | 0.336 | 0.398 |
@@ -99,6 +100,6 @@ Adding `kv` to `sites` switches the rollout to an NVFP4 KV cache (`kv_cache_dtyp
 
 ## Limitations
 
-- Some elements still disagree after guidance, and the share grows with depth as the two forwards drift apart (Qwen3-30B-A3B, `fc1`: 0.02% at layer 4, about 4% at layer 40; much more with the NVFP4 KV cache). Almost all of them are two codes apart: the rollout value lies outside the two neighbors of the training value, so one bit cannot recover it.
+- One bit cannot fix every element: when the training value is too far from the rollout value, neither neighbor matches. These cases grow with depth (Qwen3-30B-A3B `fc1`: 0.02% of elements at layer 4, about 4% at layer 40, more with the NVFP4 KV cache).
 - The rollout-side hooks patch vLLM and FlashInfer sources at fixed anchors. They are validated on the pinned vLLM nightly and FlashInfer 0.7, and fail loudly on a version they do not match.
 - The async vLLM engine and SingleController are not supported yet.
