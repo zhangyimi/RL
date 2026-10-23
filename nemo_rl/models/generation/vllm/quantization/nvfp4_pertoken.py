@@ -534,12 +534,12 @@ def trace_experts_cls(experts_cls: type) -> type:
     cached = _TRACE_EXPERTS_CLS.get(experts_cls)
     if cached is None:
         from nemo_rl.models.generation.vllm.quantization.trace_capture import (
-            TraceFc1CaptureMixin,
+            TraceFc2CaptureMixin,
         )
 
         cached = new_class(
             f"Trace{experts_cls.__name__}",
-            (TraceFc1CaptureMixin, experts_cls),
+            (TraceFc2CaptureMixin, experts_cls),
             exec_body=lambda namespace: namespace.update(__module__=__name__),
         )
         _TRACE_EXPERTS_CLS[experts_cls] = cached

@@ -28,7 +28,7 @@ Hooks (installed by :func:`apply_trace_capture_patches`):
   tell the fc1/fc2 hooks inside the kernel call which layer they belong to.
 * fc1: vLLM's ``quantize_nvfp4_per_token_input`` as bound in the TRT-LLM
   NVFP4 experts module (no vLLM source patch).
-* fc2: ``TraceFc1CaptureMixin.apply`` on NeMo-RL's per-token experts class.
+* fc2: ``TraceFc2CaptureMixin.apply`` on NeMo-RL's per-token experts class.
 * kv: ``FlashInferImpl.do_kv_cache_update`` reads the just-written NVFP4 cache
   slots back (the cache itself is the ground truth for what attention reads).
 
@@ -186,7 +186,7 @@ def capture_fc1(
     _write(rec, payload)
 
 
-class TraceFc1CaptureMixin:
+class TraceFc2CaptureMixin:
     """Mixed into NeMo-RL's per-token TRT-LLM experts class (fc2 capture)."""
 
     def apply(self, hidden_states: torch.Tensor, *args, **kwargs):
