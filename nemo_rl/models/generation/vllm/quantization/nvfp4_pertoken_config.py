@@ -19,6 +19,8 @@ from typing import Annotated
 
 from pydantic import AfterValidator, BaseModel, Field
 
+from nemo_rl.quantization.trace.config import TraceConfig
+
 NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS = 600_000
 # Keep driver-side boundary normalization aligned with the defaults on MCore's
 # TransformerConfig.  The trainer later reads the effective values directly
@@ -150,6 +152,8 @@ class NvFp4PerTokenRolloutConfig(BaseModel, extra="forbid"):
     additional_ignore: Annotated[
         list[str], AfterValidator(_require_full_expert_layer_ignores)
     ] = Field(default_factory=list)
+    # Rollout-guided rounding of the training forward (TRACE, arXiv 2610.07767).
+    trace: TraceConfig = Field(default_factory=TraceConfig)
 
     def resolved_ignore(self) -> list[str]:
         return [*DEFAULT_NVFP4_PERTOKEN_IGNORE, *self.additional_ignore]

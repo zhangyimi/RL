@@ -21,22 +21,26 @@ payload bit-for-bit next to the routes. The trainer splits the extra rows off
 before router replay sees them.
 
 Only this module decides the byte layout; vLLM capture and the trainer both
-derive it from the same model dimensions plus the ``NRL_TRACE_*`` env vars, so
-it must stay a pure function of its inputs. It imports nothing heavier than
+derive it from the same model dimensions plus the ``NRL_TRACE_*`` env vars
+(resolved from ``nvfp4_pertoken_rollout.trace`` on the driver, see
+:mod:`.config`), so it must stay a pure function of its inputs. It imports nothing heavier than
 torch because the vLLM scheduler process imports it to size its slot store.
 
 Per selected layer, a site record is ``[marker u8 x4 | scales | codes]``:
 
 * fc1 (routed-expert input, per token, shared by the token's top-k experts):
   ``[per-token fp32 scale (4B) | E4M3 block scales (H/16)] | codes`` (scales
-  only with ``NRL_TRACE_SHIP_SCALES=1``)
+  only with ``NRL_TRACE_SHIP_SCALES=1``; read by the probe only)
+* fc2 (routed-expert fc2 input, one slot per top-k expert in rollout order):
+  ``codes`` per slot
 * kv (attention cache, rollout-local KV heads; static per-layer global scale):
   ``K block scales | K codes | V block scales | V codes``
 
 ``codes`` are the packed E2M1 nibbles (``mode=full``, used by the alignment
 probe), the packed mantissa bits (``mode=lsb``, b=1 TRACE) or the two low code
-bits (``mode=b2``; KV follows ``NRL_TRACE_KV_BITS``, default 1); the mode
-is per layer (``NRL_TRACE_FULL_LAYERS`` forces full codes on probe layers).
+bits (``mode=b2``); fc2 follows ``NRL_TRACE_FC2_BITS`` and KV
+``NRL_TRACE_KV_BITS``. ``NRL_TRACE_FULL_LAYERS`` forces full fc1/KV codes on
+probe layers.
 Records are padded to whole rows.
 """
 
@@ -53,16 +57,13 @@ import torch
 FC1_LAYERS_ENV = "NRL_TRACE_FC1_LAYERS"
 KV_LAYERS_ENV = "NRL_TRACE_KV_LAYERS"
 FC2_LAYERS_ENV = "NRL_TRACE_FC2_LAYERS"
-FC2_FULL_ENV = "NRL_TRACE_FC2_FULL"
 FC2_BITS_ENV = "NRL_TRACE_FC2_BITS"
 KV_BITS_ENV = "NRL_TRACE_KV_BITS"
-# Diagnostics: raw BF16 MoE input/output + router logits per token (large).
-DBG_LAYERS_ENV = "NRL_TRACE_DBG_LAYERS"
 MODE_ENV = "NRL_TRACE_MODE"
 # Layers that always ship full 4-bit codes (alignment probe), whatever MODE is.
 FULL_LAYERS_ENV = "NRL_TRACE_FULL_LAYERS"
-# fc1 records carry the rollout scales only when this is "1" (default). The
-# phase-0 probe found trainer-computed scales guide as well as rollout ones.
+# fc1 records carry the rollout scales only when this is "1". The training
+# forward always uses its own (TE) scales; the probe compares the two.
 SHIP_SCALES_ENV = "NRL_TRACE_SHIP_SCALES"
 MARKER = 0xA5
 MARKER_BYTES = 4
@@ -73,7 +74,9 @@ _FC2_MODES = {1: "lsb", 2: "b2", 4: "full"}
 def _parse_layers(value: Optional[str]) -> tuple[int, ...]:
     if not value:
         return ()
-    return tuple(sorted({int(v) for v in re.split(r"[,:;]", value.replace(" ", "")) if v}))
+    return tuple(
+        sorted({int(v) for v in re.split(r"[,:;]", value.replace(" ", "")) if v})
+    )
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -100,26 +103,22 @@ class TraceLayout:
     kv_layers: tuple[int, ...] = ()
     fc2_layers: tuple[int, ...] = ()
     moe_intermediate_size: int = 0
-    dbg_layers: tuple[int, ...] = ()
-    num_experts: int = 0
     mode: str = "full"
     full_layers: tuple[int, ...] = ()
-    ship_scales: bool = True
-    fc2_full: bool = False
+    ship_scales: bool = False
     fc2_bits: int = 1
     kv_bits: int = 1
     fc1_records: dict[int, SiteRecord] = field(default_factory=dict, compare=False)
     kv_records: dict[int, SiteRecord] = field(default_factory=dict, compare=False)
     fc2_records: dict[int, SiteRecord] = field(default_factory=dict, compare=False)
-    dbg_records: dict[int, SiteRecord] = field(default_factory=dict, compare=False)
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
             raise ValueError(f"{MODE_ENV} must be one of {MODES}, got {self.mode!r}")
-        if self.fc2_full:
-            object.__setattr__(self, "fc2_bits", 4)
         if self.fc2_bits not in _FC2_MODES:
-            raise ValueError(f"{FC2_BITS_ENV} must be one of {tuple(_FC2_MODES)}, got {self.fc2_bits}")
+            raise ValueError(
+                f"{FC2_BITS_ENV} must be one of {tuple(_FC2_MODES)}, got {self.fc2_bits}"
+            )
         if self.hidden_size % 16 or self.head_dim % 16:
             raise ValueError("hidden_size and head_dim must be multiples of 16")
         offset = 0
@@ -129,20 +128,20 @@ class TraceLayout:
             self.fc1_records[layer] = SiteRecord(layer, offset, rows, mode)
             offset += rows
         for layer in self.kv_layers:
-            mode = "full" if self.mode_for(layer) == "full" else {1: "lsb", 2: "b2", 4: "full"}[self.kv_bits]
+            mode = (
+                "full"
+                if self.mode_for(layer) == "full"
+                else {1: "lsb", 2: "b2", 4: "full"}[self.kv_bits]
+            )
             rows = _ceil_div(self.kv_bytes(mode), self.topk)
             self.kv_records[layer] = SiteRecord(layer, offset, rows, mode)
             offset += rows
         if self.fc2_layers and self.moe_intermediate_size % 16:
             raise ValueError("fc2 capture needs moe_intermediate_size % 16 == 0")
         for layer in self.fc2_layers:
-            # The kernel emits mantissa bits, or whole codes with fc2_full.
+            # The FlashInfer overlay writes the record's code bits directly.
             rows = _ceil_div(self.fc2_bytes, self.topk)
             self.fc2_records[layer] = SiteRecord(layer, offset, rows, self.fc2_mode)
-            offset += rows
-        for layer in self.dbg_layers:
-            rows = _ceil_div(self.dbg_bytes, self.topk)
-            self.dbg_records[layer] = SiteRecord(layer, offset, rows, "dbg")
             offset += rows
         object.__setattr__(self, "_extra_rows", offset)
 
@@ -164,11 +163,6 @@ class TraceLayout:
     @property
     def kv_side_elems(self) -> int:
         return self.num_kv_heads * self.head_dim
-
-    @property
-    def dbg_bytes(self) -> int:
-        """Marker + bf16 MoE input (H) + bf16 MoE output (H) + bf16 router logits (E)."""
-        return MARKER_BYTES + 2 * (2 * self.hidden_size + self.num_experts)
 
     @property
     def fc2_mode(self) -> str:
@@ -200,7 +194,6 @@ class TraceLayout:
         d.pop("fc1_records")
         d.pop("kv_records")
         d.pop("fc2_records")
-        d.pop("dbg_records")
         return json.dumps(d, sort_keys=True)
 
 
@@ -211,11 +204,8 @@ def layout_from_env(
     num_kv_heads: int,
     head_dim: int,
     moe_intermediate_size: int = 0,
-    num_experts: int = 0,
 ) -> TraceLayout:
     return TraceLayout(
-        dbg_layers=_parse_layers(os.environ.get(DBG_LAYERS_ENV)),
-        num_experts=num_experts,
         fc2_layers=_parse_layers(os.environ.get(FC2_LAYERS_ENV)),
         moe_intermediate_size=moe_intermediate_size,
         topk=topk,
@@ -226,8 +216,7 @@ def layout_from_env(
         kv_layers=_parse_layers(os.environ.get(KV_LAYERS_ENV)),
         mode=os.environ.get(MODE_ENV, "full"),
         full_layers=_parse_layers(os.environ.get(FULL_LAYERS_ENV)),
-        ship_scales=os.environ.get(SHIP_SCALES_ENV, "1") == "1",
-        fc2_full=os.environ.get(FC2_FULL_ENV, "0") == "1",
+        ship_scales=os.environ.get(SHIP_SCALES_ENV, "0") == "1",
         fc2_bits=int(os.environ.get(FC2_BITS_ENV) or 1),
         kv_bits=int(os.environ.get(KV_BITS_ENV) or 1),
     )
@@ -238,7 +227,6 @@ def trace_requested() -> bool:
         _parse_layers(os.environ.get(FC1_LAYERS_ENV))
         or _parse_layers(os.environ.get(KV_LAYERS_ENV))
         or _parse_layers(os.environ.get(FC2_LAYERS_ENV))
-        or _parse_layers(os.environ.get(DBG_LAYERS_ENV))
     )
 
 
@@ -257,8 +245,9 @@ def layout_for_hf_config(hf_text_config, *, kv_tp_size: int = 1) -> TraceLayout:
         hidden_size=int(hf_text_config.hidden_size),
         num_kv_heads=num_kv // kv_tp_size,
         head_dim=head_dim,
-        moe_intermediate_size=int(getattr(hf_text_config, "moe_intermediate_size", 0) or 0),
-        num_experts=int(getattr(hf_text_config, "num_experts", 0) or 0),
+        moe_intermediate_size=int(
+            getattr(hf_text_config, "moe_intermediate_size", 0) or 0
+        ),
     )
 
 
@@ -270,7 +259,9 @@ def extra_rows_for_vllm_config(vllm_config) -> int:
     if tp != 1:
         # Only TP rank 0's routed-experts reach the scheduler; KV heads and
         # fc2 shards on other ranks would be silently dropped.
-        raise ValueError(f"TRACE capture requires vLLM tensor_parallel_size=1, got {tp}")
+        raise ValueError(
+            f"TRACE capture requires vLLM tensor_parallel_size=1, got {tp}"
+        )
     return layout_for_hf_config(vllm_config.model_config.hf_text_config).extra_rows
 
 
@@ -286,14 +277,19 @@ def _bytes(t: torch.Tensor) -> torch.Tensor:
 def _code_payload(mode: str, packed_codes: torch.Tensor) -> torch.Tensor:
     if mode == "full":
         return _bytes(packed_codes)
-    from nemo_rl.quantization.trace.codec import fp4_lsb_from_packed, fp4_low2_from_packed
+    from nemo_rl.quantization.trace.codec import (
+        fp4_lsb_from_packed,
+        fp4_low2_from_packed,
+    )
 
     if mode == "b2":
         return fp4_low2_from_packed(_bytes(packed_codes))
     return fp4_lsb_from_packed(_bytes(packed_codes))
 
 
-def _pad_to_rows(layout: TraceLayout, parts: list[torch.Tensor], rows: int) -> torch.Tensor:
+def _pad_to_rows(
+    layout: TraceLayout, parts: list[torch.Tensor], rows: int
+) -> torch.Tensor:
     n = parts[0].shape[0]
     rec = torch.cat(parts, dim=1)
     pad = rows * layout.topk - rec.shape[1]
@@ -316,7 +312,10 @@ def encode_fc1(
     n = packed_codes.shape[0]
     parts = [_marker(n, packed_codes.device)]
     if layout.ship_scales:
-        parts += [_bytes(token_scale.to(torch.float32).reshape(n, 1)), _bytes(block_scale)]
+        parts += [
+            _bytes(token_scale.to(torch.float32).reshape(n, 1)),
+            _bytes(block_scale),
+        ]
     parts.append(_code_payload(rec.mode, packed_codes))
     return _pad_to_rows(layout, parts, rec.rows)
 
@@ -350,7 +349,9 @@ class DecodedFc1:
     valid: torch.Tensor  # [n] bool
     token_scale: Optional[torch.Tensor]  # [n] fp32 (None unless ship_scales)
     block_scale: Optional[torch.Tensor]  # [n, H/16] float8_e4m3fn
-    codes: torch.Tensor  # [n, H/2] nibbles (full), [n, H/4] low-2 bits (b2) or [n, H/8] bits (lsb)
+    codes: (
+        torch.Tensor
+    )  # [n, H/2] nibbles (full), [n, H/4] low-2 bits (b2) or [n, H/8] bits (lsb)
     mode: str
 
     def guide_codes(self) -> torch.Tensor:
@@ -386,7 +387,9 @@ class DecodedKV:
     mode: str
 
 
-def _record_bytes(layout: TraceLayout, trace_rows: torch.Tensor, rec: SiteRecord) -> torch.Tensor:
+def _record_bytes(
+    layout: TraceLayout, trace_rows: torch.Tensor, rec: SiteRecord
+) -> torch.Tensor:
     n = trace_rows.shape[0]
     rows = trace_rows[:, rec.row_offset : rec.row_offset + rec.rows, :]
     # Each element carries one byte; the carrier may be int8/int16/int32/long
@@ -421,7 +424,12 @@ def decode_kv(layout: TraceLayout, trace_rows: torch.Tensor, layer: int) -> Deco
     o = MARKER_BYTES
     out = []
     for _ in range(2):
-        sf = b[:, o : o + hk * d // 16].contiguous().view(torch.float8_e4m3fn).view(n, hk, d // 16)
+        sf = (
+            b[:, o : o + hk * d // 16]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+            .view(n, hk, d // 16)
+        )
         o += hk * d // 16
         cb = layout.code_bytes(d, rec.mode)
         codes = b[:, o : o + hk * cb].contiguous().view(n, hk, cb)
@@ -447,28 +455,9 @@ def decode_fc2(layout: TraceLayout, trace_rows: torch.Tensor, layer: int) -> Dec
     rec = layout.fc2_records[layer]
     b = _record_bytes(layout, trace_rows, rec)
     n, nb = b.shape[0], layout.fc2_slot_bytes
-    lsb = b[:, MARKER_BYTES : MARKER_BYTES + layout.topk * nb].contiguous().view(n, layout.topk, nb)
+    lsb = (
+        b[:, MARKER_BYTES : MARKER_BYTES + layout.topk * nb]
+        .contiguous()
+        .view(n, layout.topk, nb)
+    )
     return DecodedFc2(_is_valid(b), lsb, rec.mode)
-
-
-def encode_dbg(layout: TraceLayout, rec: SiteRecord, x: torch.Tensor, out: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
-    n = x.shape[0]
-    parts = [
-        _marker(n, x.device),
-        _bytes(x.to(torch.bfloat16)),
-        _bytes(out.to(torch.bfloat16)),
-        _bytes(logits.to(torch.bfloat16)),
-    ]
-    return _pad_to_rows(layout, parts, rec.rows)
-
-
-def decode_dbg(layout: TraceLayout, trace_rows: torch.Tensor, layer: int):
-    rec = layout.dbg_records[layer]
-    b = _record_bytes(layout, trace_rows, rec)
-    h, e, o = layout.hidden_size, layout.num_experts, MARKER_BYTES
-    x = b[:, o : o + 2 * h].contiguous().view(torch.bfloat16)
-    o += 2 * h
-    y = b[:, o : o + 2 * h].contiguous().view(torch.bfloat16)
-    o += 2 * h
-    lg = b[:, o : o + 2 * e].contiguous().view(torch.bfloat16)
-    return _is_valid(b), x, y, lg

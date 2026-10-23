@@ -1,0 +1,17 @@
+defaults: grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken.yaml
+# TRACE (arXiv 2610.07767): the rollout records the mantissa bit of every
+# routed-expert fc1/fc2 input FP4 code and the training forward rounds toward
+# it instead of round-to-nearest. Requires router replay and vLLM TP=1.
+policy:
+  generation:
+    nvfp4_pertoken_rollout:
+      trace:
+        enabled: true
+        sites: [fc1, fc2]
+        bits: 1
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace
+  wandb:
+    name: grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace

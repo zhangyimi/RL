@@ -23,6 +23,7 @@ def _layout(monkeypatch, mode):
     monkeypatch.setenv(L.FC1_LAYERS_ENV, "4:16")
     monkeypatch.setenv(L.KV_LAYERS_ENV, "0,47")
     monkeypatch.setenv(L.MODE_ENV, mode)
+    monkeypatch.setenv(L.SHIP_SCALES_ENV, "1")
     return L.layout_from_env(topk=8, hidden_size=2048, num_kv_heads=4, head_dim=128)
 
 
@@ -120,7 +121,7 @@ def test_full_layers_and_no_scales(monkeypatch):
 
 def test_fc2_guide_follows_quantization_padding():
     pytest.importorskip("megatron.core")
-    from nemo_rl.models.megatron.trace_probe import _pad_guide_to_splits
+    from nemo_rl.models.megatron.trace_apply import _pad_guide_to_splits
 
     lsb = torch.arange(5 * 2, dtype=torch.uint8).view(5, 2)
     valid = torch.ones(5, dtype=torch.bool)
@@ -132,9 +133,14 @@ def test_fc2_guide_follows_quantization_padding():
 
 def test_fc2_full_roundtrip(monkeypatch):
     monkeypatch.setenv(L.FC2_LAYERS_ENV, "5")
-    monkeypatch.setenv(L.FC2_FULL_ENV, "1")
-    lay = L.layout_from_env(topk=8, hidden_size=2048, num_kv_heads=4, head_dim=128,
-                            moe_intermediate_size=768)
+    monkeypatch.setenv(L.FC2_BITS_ENV, "4")
+    lay = L.layout_from_env(
+        topk=8,
+        hidden_size=2048,
+        num_kv_heads=4,
+        head_dim=128,
+        moe_intermediate_size=768,
+    )
     rec = lay.fc2_records[5]
     assert rec.mode == "full" and lay.fc2_slot_bytes == 384
     codes = torch.randint(0, 256, (3, 8 * 384), dtype=torch.uint8)
@@ -145,7 +151,10 @@ def test_fc2_full_roundtrip(monkeypatch):
 
 
 def test_b2_mode_roundtrip(monkeypatch):
-    from nemo_rl.quantization.trace.codec import fp4_lsb_from_packed, fp4_low2_from_packed
+    from nemo_rl.quantization.trace.codec import (
+        fp4_lsb_from_packed,
+        fp4_low2_from_packed,
+    )
 
     monkeypatch.setenv(L.FC1_LAYERS_ENV, "3")
     monkeypatch.setenv(L.KV_LAYERS_ENV, "3")
@@ -153,13 +162,21 @@ def test_b2_mode_roundtrip(monkeypatch):
     monkeypatch.setenv(L.MODE_ENV, "b2")
     monkeypatch.setenv(L.SHIP_SCALES_ENV, "0")
     monkeypatch.setenv(L.FC2_BITS_ENV, "2")
-    lay = L.layout_from_env(topk=8, hidden_size=2048, num_kv_heads=4, head_dim=128, moe_intermediate_size=768)
+    lay = L.layout_from_env(
+        topk=8,
+        hidden_size=2048,
+        num_kv_heads=4,
+        head_dim=128,
+        moe_intermediate_size=768,
+    )
     assert lay.fc1_records[3].mode == "b2" and lay.kv_records[3].mode == "lsb"
     assert lay.fc2_records[3].mode == "b2" and lay.fc2_slot_bytes == 192
     codes = torch.randint(0, 256, (4, 1024), dtype=torch.uint8)
     rows = torch.zeros((4, lay.extra_rows, 8), dtype=torch.int32)
     r = lay.fc1_records[3]
-    rows[:, r.row_offset : r.row_offset + r.rows] = L.encode_fc1(lay, r, codes, None, None).to(torch.int32)
+    rows[:, r.row_offset : r.row_offset + r.rows] = L.encode_fc1(
+        lay, r, codes, None, None
+    ).to(torch.int32)
     d = L.decode_fc1(lay, rows.to(torch.uint8).to(torch.int8), 3)
     assert torch.equal(d.codes, fp4_low2_from_packed(codes))
     assert torch.equal(d.lsb(), fp4_lsb_from_packed(codes))
@@ -175,13 +192,17 @@ def test_encode_fc1_into_matches_torch_encoder(monkeypatch, mode):
     monkeypatch.setenv(L.SHIP_SCALES_ENV, "0")
     lay = L.layout_from_env(topk=8, hidden_size=2048, num_kv_heads=4, head_dim=128)
     n, nl = 37, 48
-    codes = torch.randint(0, 256, (n, 1024 + 32), dtype=torch.uint8, device="cuda")[:, :1024]
+    codes = torch.randint(0, 256, (n, 1024 + 32), dtype=torch.uint8, device="cuda")[
+        :, :1024
+    ]
     buf = torch.zeros((64, nl + lay.extra_rows, 8), dtype=torch.uint8, device="cuda")
     for rec in lay.fc1_records.values():
         encode_fc1_into(buf, (nl + rec.row_offset) * 8, codes, rec.mode, 2048)
         ref = L.encode_fc1(lay, rec, codes, None, None).reshape(n, -1)
         need = L.MARKER_BYTES + lay.code_bytes(2048, rec.mode)
-        got = buf[:n, nl + rec.row_offset : nl + rec.row_offset + rec.rows].reshape(n, -1)
+        got = buf[:n, nl + rec.row_offset : nl + rec.row_offset + rec.rows].reshape(
+            n, -1
+        )
         assert torch.equal(got[:, :need], ref[:, :need])
     assert not buf[n:].any() and not buf[:, :nl].any()
 
@@ -197,7 +218,9 @@ def test_capture_kv_into_matches_torch_encoder(monkeypatch, bits):
     hk, d, bs, nb = 4, 128, 16, 9
     lay = L.layout_from_env(topk=8, hidden_size=2048, num_kv_heads=hk, head_dim=d)
     rec = lay.kv_records[3]
-    cache = torch.randint(0, 256, (nb, 2 * hk, bs, d // 2 + d // 16), dtype=torch.uint8, device="cuda")
+    cache = torch.randint(
+        0, 256, (nb, 2 * hk, bs, d // 2 + d // 16), dtype=torch.uint8, device="cuda"
+    )
     slots = torch.tensor([5, 17, -1, 100, 33, 143, 0, 66], device="cuda")
     n, nl = slots.shape[0], 48
     buf = torch.zeros((16, nl + lay.extra_rows, 8), dtype=torch.uint8, device="cuda")
@@ -206,19 +229,44 @@ def test_capture_kv_into_matches_torch_encoder(monkeypatch, bits):
     valid = slots >= 0
     sl = slots.clamp(min=0)
     blk, off = sl // bs, sl % bs
+
     def split(side):  # copy of vllm.utils.torch_utils.nvfp4_split_data_scale
         full = side.shape[3]
         dd, sd = full * 8 // 9, full - full * 8 // 9
         b, h1, n2 = side.shape[:3]
-        data = torch.as_strided(side, (b, h1, n2, dd), (side.stride(0), side.stride(1) * dd // full, side.stride(2) * dd // full, 1), storage_offset=side.storage_offset())
-        sc = torch.as_strided(side, (b, h1, n2, sd), (side.stride(0), side.stride(1) * sd // full, side.stride(2) * sd // full, 1), storage_offset=side.storage_offset() + h1 * n2 * dd)
+        data = torch.as_strided(
+            side,
+            (b, h1, n2, dd),
+            (
+                side.stride(0),
+                side.stride(1) * dd // full,
+                side.stride(2) * dd // full,
+                1,
+            ),
+            storage_offset=side.storage_offset(),
+        )
+        sc = torch.as_strided(
+            side,
+            (b, h1, n2, sd),
+            (
+                side.stride(0),
+                side.stride(1) * sd // full,
+                side.stride(2) * sd // full,
+                1,
+            ),
+            storage_offset=side.storage_offset() + h1 * n2 * dd,
+        )
         return data, sc
 
     s_dim = d // 16
     kd, ks = split(cache[:, :hk])
     vd, vs = split(cache[:, hk:])
     k_d, k_s = kd[blk, :, off], ks[blk, :, off]
-    flat = (off // 4).unsqueeze(1) * (4 * s_dim) + torch.arange(s_dim, device="cuda") * 4 + (off % 4).unsqueeze(1)
+    flat = (
+        (off // 4).unsqueeze(1) * (4 * s_dim)
+        + torch.arange(s_dim, device="cuda") * 4
+        + (off % 4).unsqueeze(1)
+    )
     vsf_t = vs.permute(0, 2, 3, 1)
     v_s = vsf_t[blk.unsqueeze(1), flat // s_dim, flat % s_dim].permute(0, 2, 1)
     v_d = vd[blk, :, off]

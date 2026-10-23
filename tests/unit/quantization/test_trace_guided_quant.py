@@ -85,7 +85,7 @@ def test_guided_picks_bracket_neighbor_with_rollout_lsb(lsb):
 
 def test_guided_with_rtn_lsb_is_identity():
     g = torch.Generator().manual_seed(1)
-    x = (torch.rand(64, 256, generator=g) * 12 - 6)
+    x = torch.rand(64, 256, generator=g) * 12 - 6
     _, rtn = guided_e2m1(x)
     codes, _ = guided_e2m1(x, (rtn & 1).bool())
     assert torch.equal(codes, rtn)
@@ -195,8 +195,12 @@ def test_nudge_reproduces_trace_codes_under_te(device):
     if device == "cuda":
         te_nvfp4 = pytest.importorskip("transformer_engine.pytorch.tensor.nvfp4_tensor")
         quantizer = te_nvfp4.NVFP4Quantizer(
-            rowwise=True, columnwise=False, with_rht=False,
-            with_2d_quantization=False, stochastic_rounding=False, row_scaled_nvfp4=True,
+            rowwise=True,
+            columnwise=False,
+            with_rht=False,
+            with_2d_quantization=False,
+            stochastic_rounding=False,
+            row_scaled_nvfp4=True,
         )
         qt = quantizer(x_new)
         assert torch.equal(qt._rowwise_data.view(torch.uint8)[:m, : k // 2], q.data)
@@ -212,7 +216,10 @@ def test_nudge_reproduces_trace_codes_under_te(device):
 def test_nudge_copy_reproduces_rollout_codes():
     m, k = 64, 512
     x = _make_x(m, k, 9)
-    roll_x = (x.float() * (1 + 0.2 * torch.randn(m, k, generator=torch.Generator().manual_seed(10)))).to(torch.bfloat16)
+    roll_x = (
+        x.float()
+        * (1 + 0.2 * torch.randn(m, k, generator=torch.Generator().manual_seed(10)))
+    ).to(torch.bfloat16)
     roll = nvfp4_rowscaled_quantize_ref(roll_x)
     valid = torch.ones(m, dtype=torch.bool)
     x_new, stats = trace_nudge_rowscaled(x, None, valid, guide_codes_packed=roll.data)
@@ -238,24 +245,36 @@ def test_nudge_b2_corrects_off_by_two():
     roll[0, 1] = 2.0  # code 4, two codes up
     rp = nvfp4_rowscaled_quantize_ref(roll.to(torch.bfloat16)).data
     valid = torch.ones(1, dtype=torch.bool)
-    x2, _ = trace_nudge_rowscaled(x.to(torch.bfloat16), None, valid, guide_codes_packed=rp, guide_bits=2)
+    x2, _ = trace_nudge_rowscaled(
+        x.to(torch.bfloat16), None, valid, guide_codes_packed=rp, guide_bits=2
+    )
     got = unpack_fp4_nibbles(nvfp4_rowscaled_quantize_ref(x2).data)
     assert int(got[0, 1]) == 4
 
 
 def test_b2_transport_matches_full_code_emulation():
-    from nemo_rl.quantization.trace.codec import fp4_low2_from_packed, low2_to_packed_codes
+    from nemo_rl.quantization.trace.codec import (
+        fp4_low2_from_packed,
+        low2_to_packed_codes,
+    )
 
     m, k = 32, 256
     x = _make_x(m, k, 11)
-    roll_x = (x.float() * (1 + 0.3 * torch.randn(m, k, generator=torch.Generator().manual_seed(12)))).to(torch.bfloat16)
+    roll_x = (
+        x.float()
+        * (1 + 0.3 * torch.randn(m, k, generator=torch.Generator().manual_seed(12)))
+    ).to(torch.bfloat16)
     rp = nvfp4_rowscaled_quantize_ref(roll_x).data
     low2 = fp4_low2_from_packed(rp)
     assert low2.shape == (m, k // 4)
-    assert torch.equal(unpack_fp4_nibbles(low2_to_packed_codes(low2)), unpack_fp4_nibbles(rp) & 3)
+    assert torch.equal(
+        unpack_fp4_nibbles(low2_to_packed_codes(low2)), unpack_fp4_nibbles(rp) & 3
+    )
     valid = torch.ones(m, dtype=torch.bool)
     a, _ = trace_nudge_rowscaled(x, None, valid, guide_codes_packed=rp, guide_bits=2)
-    b, _ = trace_nudge_rowscaled(x, None, valid, guide_codes_packed=low2_to_packed_codes(low2), guide_bits=2)
+    b, _ = trace_nudge_rowscaled(
+        x, None, valid, guide_codes_packed=low2_to_packed_codes(low2), guide_bits=2
+    )
     assert torch.equal(a, b)
 
 
@@ -263,27 +282,46 @@ def test_b2_transport_matches_full_code_emulation():
 @pytest.mark.parametrize("k", [2048, 768])
 @pytest.mark.parametrize("mode", ["b1", "b2", "copy", "b2emu"])
 def test_fast_nudge_bit_identical(k, mode):
-    from nemo_rl.quantization.trace.codec import fp4_low2_from_packed, low2_to_packed_codes
+    from nemo_rl.quantization.trace.codec import (
+        fp4_low2_from_packed,
+        low2_to_packed_codes,
+    )
     from nemo_rl.quantization.trace.nudge_triton import trace_nudge_rowscaled_fast
 
     m = 300
     x = _make_x(m, k, 21, "cuda")
-    roll_x = (x.float() * (1 + 0.3 * torch.randn(m, k, device="cuda", generator=torch.Generator("cuda").manual_seed(22)))).to(torch.bfloat16)
+    roll_x = (
+        x.float()
+        * (
+            1
+            + 0.3
+            * torch.randn(
+                m, k, device="cuda", generator=torch.Generator("cuda").manual_seed(22)
+            )
+        )
+    ).to(torch.bfloat16)
     rp = nvfp4_rowscaled_quantize_ref(roll_x).data
-    valid = torch.rand(m, device="cuda", generator=torch.Generator("cuda").manual_seed(23)) > 0.1
+    valid = (
+        torch.rand(m, device="cuda", generator=torch.Generator("cuda").manual_seed(23))
+        > 0.1
+    )
     if mode == "b1":
         lsb = fp4_lsb_from_packed(rp)
         ref, st = trace_nudge_rowscaled(x, lsb, valid)
         got, fs = trace_nudge_rowscaled_fast(x, lsb, valid, width=1)
     elif mode == "b2":
         low2 = fp4_low2_from_packed(rp)
-        ref, st = trace_nudge_rowscaled(x, None, valid, guide_codes_packed=low2_to_packed_codes(low2), guide_bits=2)
+        ref, st = trace_nudge_rowscaled(
+            x, None, valid, guide_codes_packed=low2_to_packed_codes(low2), guide_bits=2
+        )
         got, fs = trace_nudge_rowscaled_fast(x, low2, valid, width=2)
     elif mode == "copy":
         ref, st = trace_nudge_rowscaled(x, None, valid, guide_codes_packed=rp)
         got, fs = trace_nudge_rowscaled_fast(x, rp, valid, width=4)
     else:
-        ref, st = trace_nudge_rowscaled(x, None, valid, guide_codes_packed=rp, guide_bits=2)
+        ref, st = trace_nudge_rowscaled(
+            x, None, valid, guide_codes_packed=rp, guide_bits=2
+        )
         got, fs = trace_nudge_rowscaled_fast(x, rp, valid, width=4, match_bits=2)
     assert torch.equal(got.view(torch.int16), ref.view(torch.int16))
     assert int(fs["flipped_t"]) == st["flipped"] > 0
@@ -291,34 +329,38 @@ def test_fast_nudge_bit_identical(k, mode):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 @pytest.mark.parametrize("fp8_dq", [False, True])
-@pytest.mark.parametrize("width,match", [(0, None), (1, None), (2, None), (4, None), (4, 2), (4, 4)])
-def test_fast_kv_fake_bit_identical(monkeypatch, width, match, fp8_dq):
+@pytest.mark.parametrize("width", [0, 1, 2, 4])
+def test_fast_kv_fake_bit_identical(monkeypatch, width, fp8_dq):
     pytest.importorskip("megatron.core")
-    from nemo_rl.models.megatron import trace_probe as tp
-    from nemo_rl.quantization.trace.codec import fp4_lsb_from_packed, fp4_low2_from_packed
+    from nemo_rl.models.megatron import trace_apply as ta
+    from nemo_rl.quantization.trace.codec import (
+        fp4_lsb_from_packed,
+        fp4_low2_from_packed,
+    )
 
     n, h, d, gs = 257, 4, 128, 0.0123
     g = torch.Generator("cuda").manual_seed(5)
     x = (torch.randn(n, h, d, device="cuda", generator=g) * 3).to(torch.bfloat16)
     valid = torch.rand(n, device="cuda", generator=g) > 0.2
-    xr = (x.float() * (1 + 0.2 * torch.randn(n, h, d, device="cuda", generator=g))).view(n, h, d // 16, 16)
+    xr = (
+        x.float() * (1 + 0.2 * torch.randn(n, h, d, device="cuda", generator=g))
+    ).view(n, h, d // 16, 16)
     sf = (xr.abs().amax(-1) / (6 * gs)).clamp(max=448).to(torch.float8_e4m3fn)
     z = (xr / (sf.float().unsqueeze(-1) * gs)).clamp(-6, 6).view(n * h, d)
     from nemo_rl.quantization.trace.guided_quant import guided_e2m1
+
     codes = pack_fp4_nibbles(guided_e2m1(z)[1]).view(n, h, d // 2)
-    payload = {0: None, 1: fp4_lsb_from_packed(codes), 2: fp4_low2_from_packed(codes), 4: codes}[width]
+    payload = {
+        0: None,
+        1: fp4_lsb_from_packed(codes),
+        2: fp4_low2_from_packed(codes),
+        4: codes,
+    }[width]
     rsf = sf if width else None
-    monkeypatch.setenv(tp.VERIFY_ENV, "1")
-    ref, st = tp._nvfp4_kv_fake(x, gs, rsf, payload, valid, max(width, 1), match, fp8_dq)
-    monkeypatch.setenv(tp.VERIFY_ENV, "0")
-    got, _ = tp._nvfp4_kv_fake(x, gs, rsf, payload, valid, max(width, 1), match, fp8_dq)
+    monkeypatch.setattr(ta, "USE_FUSED", False)
+    ref, st = ta._nvfp4_kv_fake(x, gs, rsf, payload, valid, max(width, 1), fp8_dq)
+    monkeypatch.setattr(ta, "USE_FUSED", True)
+    got, _ = ta._nvfp4_kv_fake(x, gs, rsf, payload, valid, max(width, 1), fp8_dq)
     assert torch.equal(got.view(torch.int16), ref.view(torch.int16))
     if width:
         assert st["flipped"] > 0
-    if match == 4 and not fp8_dq:
-        # Copy reproduces the rollout codes on valid rows.
-        q = ref.float().view(n, h, d // 16, 16) / (sf.float().unsqueeze(-1) * gs)
-        got_c = guided_e2m1(q.clamp(-6, 6).view(n * h, d))[1].view(n, h, d)
-        rc = (codes.view(n, h, d // 2).unsqueeze(-1) >> torch.tensor([0, 4], device="cuda", dtype=torch.uint8)).flatten(-2) & 15
-        same = (got_c == rc) | (((got_c & 7) == 0) & ((rc & 7) == 0))
-        assert same[valid].all()

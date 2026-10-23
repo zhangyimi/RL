@@ -1264,7 +1264,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 routed_experts_list.append(full_routed_experts)
             if trace_enabled:
                 # TRACE payload stays in this node's object store; only the
-                # ref crosses the driver (see trace_probe.attach_trace_rows).
+                # ref crosses the driver (see trace_apply.attach_trace_rows).
                 trace_np = r3_stats.pop("trace", None) if r3_stats else None
                 trace_refs.append(ray.put(trace_np) if trace_np is not None else None)
                 # vLLM's capture arrays carry the full TRACE rows; drop them

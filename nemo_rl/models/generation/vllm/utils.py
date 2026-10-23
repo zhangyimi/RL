@@ -262,8 +262,6 @@ def pad_and_align_routed_expert_indices(
     # unpadded and uncast, so only the routes enter the padded batch tensors.
     trace = None
     if G_TRACE_EXTRA_ROWS:
-        import numpy as np
-
         parts = []
         if prompt_routed is not None:
             prompt_routed = np.asarray(prompt_routed)

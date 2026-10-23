@@ -88,7 +88,9 @@ def guided_e2m1(
     return mag_code.to(torch.uint8) | sign, rtn.to(torch.uint8) | sign
 
 
-def nearest_code_with_low_bits(scaled: torch.Tensor, low: torch.Tensor, bits: int) -> torch.Tensor:
+def nearest_code_with_low_bits(
+    scaled: torch.Tensor, low: torch.Tensor, bits: int
+) -> torch.Tensor:
     """Magnitude code (0..7) nearest to ``|scaled|`` whose low ``bits`` equal ``low``.
 
     Ties go to the smaller code. This is b>=2 TRACE guidance: with two bits an
@@ -157,14 +159,18 @@ def nvfp4_rowscaled_quantize_ref(
         )
         global_decode = torch.div(1.0, global_encode)
         vec_max = xb.abs().amax(dim=-1, keepdim=True).to(torch.float32)
-        decode = torch.minimum(vec_max * (global_encode * torch.reciprocal(fp4_max)), fp32_max)
+        decode = torch.minimum(
+            vec_max * (global_encode * torch.reciprocal(fp4_max)), fp32_max
+        )
         decode = decode.clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
     else:
         global_decode = rollout_token_scale.to(torch.float32).view(m, 1, 1)
         row_amax = rollout_token_scale.to(torch.float32) * (E4M3_MAX * FP4_MAX)
         decode = rollout_decode_scale.view(m, k // BLOCK, 1)
 
-    encode = torch.minimum(torch.div(1.0, decode.to(torch.float32) * global_decode), fp32_max)
+    encode = torch.minimum(
+        torch.div(1.0, decode.to(torch.float32) * global_decode), fp32_max
+    )
     scaled = (xb.to(torch.float32) * encode).clamp(-FP4_MAX, FP4_MAX).view(m, k)
 
     guide = None
@@ -174,8 +180,10 @@ def nvfp4_rowscaled_quantize_ref(
     if guide is not None and guide_valid is not None:
         codes = torch.where(guide_valid.view(m, 1), codes, rtn)
 
-    n_guided = 0 if guide is None else (
-        k * (m if guide_valid is None else int(guide_valid.sum()))
+    n_guided = (
+        0
+        if guide is None
+        else (k * (m if guide_valid is None else int(guide_valid.sum())))
     )
     stats = GuidedRoundStats(
         elements=m * k,
@@ -241,7 +249,8 @@ def trace_nudge_rowscaled(
     is_block_max = xb.abs() == xb.abs().amax(dim=-1, keepdim=True)
 
     encode = torch.minimum(
-        torch.div(1.0, scale), torch.tensor(torch.finfo(torch.float32).max, device=x.device)
+        torch.div(1.0, scale),
+        torch.tensor(torch.finfo(torch.float32).max, device=x.device),
     )
     scaled = (xb.to(torch.float32) * encode).clamp(-FP4_MAX, FP4_MAX).view(m, k)
     if guide_codes_packed is None:
@@ -253,7 +262,9 @@ def trace_nudge_rowscaled(
         _, rtn = guided_e2m1(scaled)
         guided = unpack_fp4_nibbles(guide_codes_packed)[:, :k]
         if guide_bits < 4:
-            mag_code = nearest_code_with_low_bits(scaled, guided, guide_bits).to(torch.uint8)
+            mag_code = nearest_code_with_low_bits(scaled, guided, guide_bits).to(
+                torch.uint8
+            )
             guided = mag_code | ((scaled < 0).to(torch.uint8) << 3)
         # Never exceed the block maximum's code: that would move the amax/scale.
         cap = (rtn & 7).view(m, k // BLOCK, BLOCK).amax(dim=-1, keepdim=True)
@@ -283,6 +294,10 @@ def trace_nudge_rowscaled(
         "guided_tokens": int(guide_valid.sum()),
         "flipped": int(flip.sum()),
         "unreproduced": int(unrep.sum()),
-        "scale_changed": int((check.decode_scale.view(torch.uint8) != q.decode_scale.view(torch.uint8)).sum()),
+        "scale_changed": int(
+            (
+                check.decode_scale.view(torch.uint8) != q.decode_scale.view(torch.uint8)
+            ).sum()
+        ),
     }
     return x_new, stats

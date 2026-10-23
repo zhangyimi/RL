@@ -41,7 +41,7 @@ _MODULE: Any = None
 _INSTALLED = False
 
 _RUNNER_INCLUDE_ANCHOR = '#include "tensorrt_llm/kernels/quantization.h"\n'
-_RUNNER_GLOBALS = r'''
+_RUNNER_GLOBALS = r"""
 // ---- NeMo-RL TRACE: fc2 input code-bit capture ------------------------------
 namespace nrl_trace {
 uint8_t* g_fc2_out = nullptr;  // record base (transit buffer + byte offset)
@@ -94,7 +94,7 @@ extern "C" void nrl_trace_set_fc2_out(void* p, int64_t stride, int bits, int32_t
   nrl_trace::g_fc2_width = width;
 }
 // ---------------------------------------------------------------------------
-'''
+"""
 _RUNNER_FINALIZE_ANCHOR = (
     "  // Run finalize\n"
     "  if (args.do_finalize) {\n"
@@ -103,7 +103,7 @@ _RUNNER_FINALIZE_ANCHOR = (
     "    sync_check_cuda_error(stream);\n"
     "  }\n"
 )
-_RUNNER_CAPTURE = r'''
+_RUNNER_CAPTURE = r"""
   // NeMo-RL TRACE: capture fc2 input code bits (per-token NVFP4 path only).
   if (mUsePerTokenScalingGemm2 && ::nrl_trace::g_fc2_out != nullptr) {
     int32_t numExpanded = args.num_tokens * totalExpertsPerToken;
@@ -118,9 +118,9 @@ _RUNNER_CAPTURE = r'''
         reinterpret_cast<uint8_t const*>(workspace.activation_output),
         ::nrl_trace::g_fc2_out);
   }
-'''
+"""
 _LAUNCHER_TAIL_ANCHOR = "}  // namespace flashinfer\n"
-_LAUNCHER_EXPORT = r'''
+_LAUNCHER_EXPORT = r"""
 extern "C" void nrl_trace_set_fc2_out(void* p, int64_t stride, int bits, int32_t width);
 void nrl_trace_set_fc2_out_ffi(Optional<TensorView> buf, int64_t byte_offset, int64_t row_stride,
                                int64_t bits, int64_t width) {
@@ -130,13 +130,17 @@ void nrl_trace_set_fc2_out_ffi(Optional<TensorView> buf, int64_t byte_offset, in
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nrl_trace_set_fc2_out, nrl_trace_set_fc2_out_ffi);
 
-'''
+"""
 
 
-def _patch_once(text: str, anchor: str, new: str, *, before: bool = False, last: bool = False) -> str:
+def _patch_once(
+    text: str, anchor: str, new: str, *, before: bool = False, last: bool = False
+) -> str:
     count = text.count(anchor)
     if count == 0 or (count > 1 and not last):
-        raise RuntimeError(f"TRACE FlashInfer overlay anchor found {count}x: {anchor[:60]!r}")
+        raise RuntimeError(
+            f"TRACE FlashInfer overlay anchor found {count}x: {anchor[:60]!r}"
+        )
     idx = text.rfind(anchor) if last else text.find(anchor)
     if before:
         return text[:idx] + new + text[idx:]
@@ -151,12 +155,32 @@ def _write_overlay(csrc_dir, out_dir) -> tuple:
     runner = _patch_once(runner, _RUNNER_INCLUDE_ANCHOR, _RUNNER_GLOBALS)
     runner = _patch_once(runner, _RUNNER_FINALIZE_ANCHOR, _RUNNER_CAPTURE)
     launcher = (csrc_dir / "trtllm_fused_moe_kernel_launcher.cu").read_text()
-    launcher = _patch_once(launcher, _LAUNCHER_TAIL_ANCHOR, _LAUNCHER_EXPORT, before=True, last=True)
+    launcher = _patch_once(
+        launcher, _LAUNCHER_TAIL_ANCHOR, _LAUNCHER_EXPORT, before=True, last=True
+    )
     runner_path = out_dir / "trtllm_fused_moe_runner.cu"
     launcher_path = out_dir / "trtllm_fused_moe_kernel_launcher.cu"
     write_if_different(runner_path, runner)
     write_if_different(launcher_path, launcher)
     return runner_path, launcher_path
+
+
+def _default_jit_env() -> None:
+    """JIT build defaults: SM100-family kernels and the newest local CUDA 13.
+
+    The first build takes ~15 minutes; point ``FLASHINFER_WORKSPACE_BASE`` at a
+    shared directory so later jobs reuse it.
+    """
+    import glob
+    import os
+    import re
+
+    os.environ.setdefault("FLASHINFER_CUDA_ARCH_LIST", "10.0f")
+    if not os.environ.get("CUDA_HOME"):
+        found = glob.glob("/usr/local/cuda-13*")
+        if found:
+            key = lambda p: [int(x) for x in re.findall(r"\d+", p)]  # noqa: E731
+            os.environ["CUDA_HOME"] = max(found, key=key)
 
 
 def install() -> None:
@@ -168,6 +192,7 @@ def install() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
+    _default_jit_env()
     import flashinfer.fused_moe.core as fi_core
     from flashinfer.jit import env as jit_env
 
@@ -207,7 +232,10 @@ def install() -> None:
 
     fi_core.gen_trtllm_gen_fused_moe_sm100_module = gen
     _INSTALLED = True
-    print("[trace] FlashInfer TRT-LLM MoE routed through the fc2-capture overlay", flush=True)
+    print(
+        "[trace] FlashInfer TRT-LLM MoE routed through the fc2-capture overlay",
+        flush=True,
+    )
 
 
 def set_fc2_out(

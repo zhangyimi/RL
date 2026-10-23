@@ -259,7 +259,7 @@ def make_processed_microbatch_iterator(
             )
 
         if "trace_refs" in data_dict:
-            from nemo_rl.models.megatron.trace_probe import attach_trace_rows
+            from nemo_rl.models.megatron.trace_apply import attach_trace_rows
 
             attach_trace_rows(data_dict)
 

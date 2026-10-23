@@ -77,7 +77,10 @@ def fp4_low2_from_packed(packed: torch.Tensor) -> torch.Tensor:
 
 
 def low2_to_packed_codes(low2: torch.Tensor) -> torch.Tensor:
-    """Inverse view of :func:`fp4_low2_from_packed`: ``[..., K/4]`` -> packed
-    nibbles ``[..., K/2]`` whose codes carry only the two low bits."""
+    """Inverse view of :func:`fp4_low2_from_packed`.
+
+    ``[..., K/4]`` -> packed nibbles ``[..., K/2]`` whose codes carry only the
+    two low bits.
+    """
     c = ((low2.unsqueeze(-1) >> (2 * _shifts(low2.device)[:4])) & 3).flatten(-2)
     return pack_fp4_nibbles(c)

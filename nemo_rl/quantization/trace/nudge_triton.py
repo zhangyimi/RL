@@ -47,9 +47,16 @@ def _mag_of(c):
 
 @triton.jit
 def _nudge_kernel(
-    x_ptr, out_ptr, guide_ptr, valid_ptr, flips_ptr,
-    K, guide_row_bytes,
-    BLOCK_K: tl.constexpr, WIDTH: tl.constexpr, MATCH: tl.constexpr,
+    x_ptr,
+    out_ptr,
+    guide_ptr,
+    valid_ptr,
+    flips_ptr,
+    K,
+    guide_row_bytes,
+    BLOCK_K: tl.constexpr,
+    WIDTH: tl.constexpr,
+    MATCH: tl.constexpr,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_K)
@@ -61,7 +68,9 @@ def _nudge_kernel(
 
     # TE row-scaled NVFP4 scales (same op order as the torch reference).
     row_amax = tl.max(ax, axis=0)
-    g_enc = tl.minimum(tl.math.div_rn(tl.zeros_like(row_amax) + 2688.0, row_amax), fp32_max)
+    g_enc = tl.minimum(
+        tl.math.div_rn(tl.zeros_like(row_amax) + 2688.0, row_amax), fp32_max
+    )
     g_enc = tl.where(g_enc == 0.0, 1.0, g_enc)
     g_dec = tl.math.div_rn(tl.zeros_like(g_enc) + 1.0, g_enc)
     ax2 = tl.reshape(ax, (BLOCK_K // 16, 16))
@@ -73,16 +82,24 @@ def _nudge_kernel(
     scale = dec * g_dec
     enc = tl.minimum(tl.math.div_rn(tl.zeros_like(scale) + 1.0, scale), fp32_max)
     is_max2 = ax2 == vmax[:, None]
-    scale_e = tl.reshape(tl.broadcast_to(scale[:, None], (BLOCK_K // 16, 16)), (BLOCK_K,))
+    scale_e = tl.reshape(
+        tl.broadcast_to(scale[:, None], (BLOCK_K // 16, 16)), (BLOCK_K,)
+    )
     enc_e = tl.reshape(tl.broadcast_to(enc[:, None], (BLOCK_K // 16, 16)), (BLOCK_K,))
     is_max = tl.reshape(is_max2, (BLOCK_K,))
 
     s = tl.minimum(tl.maximum(x * enc_e, -6.0), 6.0)
     mag = tl.abs(s)
     neg = s < 0
-    lower = ((mag >= 0.5).to(tl.int32) + (mag >= 1.0).to(tl.int32) + (mag >= 1.5).to(tl.int32)
-             + (mag >= 2.0).to(tl.int32) + (mag >= 3.0).to(tl.int32) + (mag >= 4.0).to(tl.int32)
-             + (mag >= 6.0).to(tl.int32))
+    lower = (
+        (mag >= 0.5).to(tl.int32)
+        + (mag >= 1.0).to(tl.int32)
+        + (mag >= 1.5).to(tl.int32)
+        + (mag >= 2.0).to(tl.int32)
+        + (mag >= 3.0).to(tl.int32)
+        + (mag >= 4.0).to(tl.int32)
+        + (mag >= 6.0).to(tl.int32)
+    )
     upper = tl.minimum(lower + 1, 7)
     lo_v = _mag_of(lower)
     hi_v = _mag_of(upper)
@@ -92,7 +109,9 @@ def _nudge_kernel(
     rtn = tl.where(on_grid | (mag < mid) | ((mag == mid) & ~tie_up), lower, upper)
 
     bit = offs * WIDTH
-    gbyte = tl.load(guide_ptr + row * guide_row_bytes + bit // 8, mask=inb, other=0).to(tl.int32)
+    gbyte = tl.load(guide_ptr + row * guide_row_bytes + bit // 8, mask=inb, other=0).to(
+        tl.int32
+    )
     g = (gbyte >> (bit % 8)) & ((1 << WIDTH) - 1)
 
     if WIDTH == 1:
@@ -117,7 +136,9 @@ def _nudge_kernel(
             tsign = neg
         # Never exceed the block maximum's code (scales must not move).
         cap2 = tl.max(tl.reshape(rtn, (BLOCK_K // 16, 16)), axis=1)
-        cap = tl.reshape(tl.broadcast_to(cap2[:, None], (BLOCK_K // 16, 16)), (BLOCK_K,))
+        cap = tl.reshape(
+            tl.broadcast_to(cap2[:, None], (BLOCK_K // 16, 16)), (BLOCK_K,)
+        )
         guided = tl.minimum(guided, cap)
 
     valid = tl.load(valid_ptr + row).to(tl.int1)
@@ -155,9 +176,16 @@ def trace_nudge_rowscaled_fast(
     flips = torch.zeros(1, dtype=torch.int32, device=x.device)
     if m:
         _nudge_kernel[(m,)](
-            x, out, guide_packed.contiguous(), guide_valid.to(torch.int8).contiguous(), flips,
-            k, guide_packed.shape[1],
-            BLOCK_K=triton.next_power_of_2(k), WIDTH=width, MATCH=match,
+            x,
+            out,
+            guide_packed.contiguous(),
+            guide_valid.to(torch.int8).contiguous(),
+            flips,
+            k,
+            guide_packed.shape[1],
+            BLOCK_K=triton.next_power_of_2(k),
+            WIDTH=width,
+            MATCH=match,
         )
     # Counters stay on device; callers that log them pay the sync.
     return out, {"flipped_t": flips}
@@ -165,9 +193,19 @@ def trace_nudge_rowscaled_fast(
 
 @triton.jit
 def _kv_fake_kernel(
-    x_ptr, out_ptr, sf_ptr, g_ptr, valid_ptr, flips_ptr,
-    H, gscale, inv6g,
-    D: tl.constexpr, WIDTH: tl.constexpr, HAS_ROLL: tl.constexpr, MATCH: tl.constexpr,
+    x_ptr,
+    out_ptr,
+    sf_ptr,
+    g_ptr,
+    valid_ptr,
+    flips_ptr,
+    H,
+    gscale,
+    inv6g,
+    D: tl.constexpr,
+    WIDTH: tl.constexpr,
+    HAS_ROLL: tl.constexpr,
+    MATCH: tl.constexpr,
     FP8_DQ: tl.constexpr,
 ):
     # One program per (token, head) row of D elements.
@@ -181,7 +219,10 @@ def _kv_fake_kernel(
     sf = own
     if HAS_ROLL:
         valid = tl.load(valid_ptr + tok).to(tl.int1)
-        rsf = tl.load(sf_ptr + r.to(tl.int64) * (D // 16) + tl.arange(0, D // 16), cache_modifier=".cg")
+        rsf = tl.load(
+            sf_ptr + r.to(tl.int64) * (D // 16) + tl.arange(0, D // 16),
+            cache_modifier=".cg",
+        )
         rsf = rsf.to(tl.float8e4nv, bitcast=True).to(tl.float32)
         sf = tl.where(valid, rsf, own)
     scale = sf * gscale
@@ -191,9 +232,15 @@ def _kv_fake_kernel(
     z = tl.minimum(tl.maximum(x * enc_e, -6.0), 6.0)
     mag = tl.abs(z)
     neg = z < 0
-    lower = ((mag >= 0.5).to(tl.int32) + (mag >= 1.0).to(tl.int32) + (mag >= 1.5).to(tl.int32)
-             + (mag >= 2.0).to(tl.int32) + (mag >= 3.0).to(tl.int32) + (mag >= 4.0).to(tl.int32)
-             + (mag >= 6.0).to(tl.int32))
+    lower = (
+        (mag >= 0.5).to(tl.int32)
+        + (mag >= 1.0).to(tl.int32)
+        + (mag >= 1.5).to(tl.int32)
+        + (mag >= 2.0).to(tl.int32)
+        + (mag >= 3.0).to(tl.int32)
+        + (mag >= 4.0).to(tl.int32)
+        + (mag >= 6.0).to(tl.int32)
+    )
     upper = tl.minimum(lower + 1, 7)
     lo_v = _mag_of(lower)
     hi_v = _mag_of(upper)
@@ -241,9 +288,17 @@ def _kv_fake_kernel(
     tl.atomic_add(flips_ptr, tl.sum(flip.to(tl.int32), axis=0))
 
 
-def kv_fake_fast(x, gscale, roll_sf, roll_payload, valid, width: int = 1, match: int | None = None,
-                 fp8_dq: bool = False):
-    """Fused NVFP4 KV quant->dequant (see ``trace_probe._nvfp4_kv_fake``).
+def kv_fake_fast(
+    x,
+    gscale,
+    roll_sf,
+    roll_payload,
+    valid,
+    width: int = 1,
+    match: int | None = None,
+    fp8_dq: bool = False,
+):
+    """Fused NVFP4 KV quant->dequant (see ``trace_apply._nvfp4_kv_fake``).
 
     Returns the dequantized tensor (no straight-through wrapping) and stats.
     """
@@ -258,14 +313,27 @@ def kv_fake_fast(x, gscale, roll_sf, roll_payload, valid, width: int = 1, match:
         sf = roll_sf.contiguous().view(torch.uint8)
         g = roll_payload.contiguous()
         if g.shape[-1] != d * width // 8:
-            raise ValueError(f"KV payload {g.shape[-1]} B per head, expected {d * width // 8}")
+            raise ValueError(
+                f"KV payload {g.shape[-1]} B per head, expected {d * width // 8}"
+            )
         vflag = valid.to(torch.int8).contiguous()
     else:
         sf = g = vflag = x
     if n * h:
         _kv_fake_kernel[(n * h,)](
-            x, out, sf, g, vflag, flips, h, float(g32), float(inv),
-            D=d, WIDTH=width, HAS_ROLL=has_roll,
-            MATCH=(match if match is not None else (width if width < 4 else 1)), FP8_DQ=fp8_dq,
+            x,
+            out,
+            sf,
+            g,
+            vflag,
+            flips,
+            h,
+            float(g32),
+            float(inv),
+            D=d,
+            WIDTH=width,
+            HAS_ROLL=has_roll,
+            MATCH=(match if match is not None else (width if width < 4 else 1)),
+            FP8_DQ=fp8_dq,
         )
     return out, {"flipped_t": flips}
