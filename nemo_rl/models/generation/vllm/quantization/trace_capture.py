@@ -468,34 +468,42 @@ def _patch_flashinfer_out_scale(logger) -> None:
         "                self._nrl_os = layer._v_scale_float\n"
         "                self.bmm2_scale /= self._nrl_os\n"
     )
-    copies = [
-        (
-            "].copy_(out_prefill.to(output.dtype))",
-            f"].copy_(out_prefill.to(output.dtype) * {os_expr})",
-            1,
-        ),
-        (
-            "].copy_(out[:num_prefill_tokens].to(output.dtype))",
-            f"].copy_(out[:num_prefill_tokens].to(output.dtype) * {os_expr})",
-            1,
-        ),
-        (
-            "output[:num_decode_tokens].copy_(out_decode.to(output.dtype))",
-            f"output[:num_decode_tokens].copy_(out_decode.to(output.dtype) * {os_expr})",
-            1,
-        ),
-        (
-            "output[:num_decode_tokens].copy_(out.to(output.dtype))",
-            f"output[:num_decode_tokens].copy_(out.to(output.dtype) * {os_expr})",
-            1,
-        ),
-        # FlashInfer wrapper paths take v_scale directly instead of bmm2_scale.
-        (
-            "v_scale=layer._v_scale_float,",
-            f"v_scale=layer._v_scale_float / {os_expr},",
-            5,
-        ),
-    ]
+    # FP8-output copy sites differ per vLLM version; exactly one set must match.
+    copy_sets = {
+        "0.29": [
+            (
+                "].copy_(out_prefill.to(output.dtype))",
+                "].copy_(out_prefill.to(output.dtype)",
+            ),
+            (
+                "].copy_(out[:num_prefill_tokens].to(output.dtype))",
+                "].copy_(out[:num_prefill_tokens].to(output.dtype)",
+            ),
+            (
+                "output[:num_decode_tokens].copy_(out_decode.to(output.dtype))",
+                "output[:num_decode_tokens].copy_(out_decode.to(output.dtype)",
+            ),
+            (
+                "output[:num_decode_tokens].copy_(out.to(output.dtype))",
+                "output[:num_decode_tokens].copy_(out.to(output.dtype)",
+            ),
+        ],
+        "0.31": [
+            ("].copy_(out_prefill)\n", "].copy_(out_prefill.to(output.dtype)"),
+            (
+                "].copy_(out[:num_prefill_tokens])\n",
+                "].copy_(out[:num_prefill_tokens].to(output.dtype)",
+            ),
+            (
+                "output[:num_decode_tokens].copy_(out_decode)\n",
+                "output[:num_decode_tokens].copy_(out_decode.to(output.dtype)",
+            ),
+            (
+                "output[:num_decode_tokens].copy_(out)\n",
+                "output[:num_decode_tokens].copy_(out.to(output.dtype)",
+            ),
+        ],
+    }
     with _locked_file_patch(path) as (content, write_back):
         if _OSCALE_MARKER in content:
             return
@@ -504,12 +512,23 @@ def _patch_flashinfer_out_scale(logger) -> None:
                 f"NVFP4 out-scale anchor not found exactly once in {path}"
             )
         content = content.replace(init_old, init_new, 1)
-        for old, new, n in copies:
-            if content.count(old) != n:
-                raise RuntimeError(
-                    f"NVFP4 out-scale anchor {old!r} found {content.count(old)}x (want {n}) in {path}"
-                )
-            content = content.replace(old, new)
+        matched = [
+            version
+            for version, copies in copy_sets.items()
+            if all(content.count(old) == 1 for old, _ in copies)
+        ]
+        if len(matched) != 1:
+            raise RuntimeError(
+                f"NVFP4 out-scale copy anchors matched vLLM layouts {matched} in {path}"
+            )
+        for old, head in copy_sets[matched[0]]:
+            tail = "\n" if old.endswith("\n") else ""
+            content = content.replace(old, f"{head} * {os_expr}){tail}")
+        # FlashInfer wrapper paths take v_scale directly instead of bmm2_scale.
+        content = content.replace(
+            "v_scale=layer._v_scale_float,",
+            f"v_scale=layer._v_scale_float / {os_expr},",
+        )
         write_back(content)
     logger.info("Patched flashinfer.py: scaled FP8 attention output for NVFP4 KV.")
 
