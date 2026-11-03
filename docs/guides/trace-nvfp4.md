@@ -29,6 +29,8 @@ policy:
         sites: [fc1, fc2]   # add kv to also guide the NVFP4 KV cache
         bits: 1             # 2 ships two low code bits (experimental)
         layers: all         # or a list of decoder-layer indices
+        qat: false          # true: BF16 experts on fake-quantized NVFP4 (QAT)
+        ship_scales: false  # with qat: guided rows use the rollout's scales
 ```
 
 Ready-made recipes:
@@ -52,6 +54,13 @@ uv run examples/run_grpo.py \
   --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace.yaml \
   "policy.generation.nvfp4_pertoken_rollout.trace.sites=[fc1,fc2,kv]" \
   ++policy.generation.nvfp4_pertoken_rollout.trace.kv.scales_file=examples/trace/kv_amax_qwen3_30b_a3b_base.json
+```
+
+Train with QAT instead of real NVFP4: the routed experts run in BF16 on NVFP4 fake-quantized weights and activations, and the guided rows use the rollout's own scales (`ship_scales: true`). The QAT recipe guides the latter half of the layers:
+
+```sh
+uv run examples/run_grpo.py \
+  --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace-qat.yaml
 ```
 
 For the plain NVFP4 baseline, run the parent recipe. It does not have these settings, so pass them on the command line:

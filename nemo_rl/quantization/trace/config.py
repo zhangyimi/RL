@@ -55,10 +55,16 @@ class TraceConfig(BaseModel, extra="forbid"):
     # (fc1/fc2) and every attention layer (kv).
     layers: Union[Literal["all"], list[int]] = "all"
     kv: TraceKVConfig = Field(default_factory=TraceKVConfig)
-    # Ship the rollout's per-token and block scales with fc1 records. The
-    # training forward always quantizes with its own scales (TE computes them);
-    # shipped scales are only read by the alignment probe.
+    # Ship the rollout's per-token and block scales with the fc1/fc2 records.
+    # With ``qat`` the guided rows are fake-quantized under these scales (the
+    # paper's normalisation); otherwise TE quantizes with its own scales and
+    # the shipped ones are only read by the alignment probe.
     ship_scales: bool = False
+    # QAT: the routed experts run in BF16 on NVFP4 fake-quantized operands
+    # (fc1/fc2 inputs per token, TRACE-guided on ``layers``; expert weights per
+    # tensor), on every NVFP4 MoE layer. Needs a BF16 TE precision recipe, e.g.
+    # examples/te_precision/all_bf16_trace_qat.yaml.
+    qat: bool = False
     # Rollout/train FP4 alignment probe: JSON lines under ``probe_dir``;
     # ``probe_layers`` additionally ship full 4-bit codes for exact statistics.
     probe_dir: Optional[str] = None
@@ -110,6 +116,7 @@ def resolve_trace_env(
     hybrid = any(t in ("attention", "mamba") for t in types)
     moe = [i for i, t in enumerate(types) if t == "moe" and i not in bf16_layers]
     attn = [i for i, t in enumerate(types) if t == "attention" or not hybrid]
+    qat_layers = list(moe)
     if trace.layers != "all":
         sel = set(trace.layers)
         moe = [i for i in moe if i in sel]
@@ -138,6 +145,9 @@ def resolve_trace_env(
         apply += ["kv" if trace.kv.mode == "trace" else "kv_rtn", "kv8"]
     if trace.kv.calib_dir:
         env["NRL_TRACE_KV_CALIB_DIR"] = trace.kv.calib_dir
+    if trace.qat:
+        env["NRL_TRACE_QAT"] = "1"
+        env["NRL_TRACE_QAT_LAYERS"] = _join(qat_layers)
     env["NRL_TRACE_APPLY"] = ",".join(apply)
     if trace.probe_dir:
         env["NRL_TRACE_PROBE_DIR"] = trace.probe_dir

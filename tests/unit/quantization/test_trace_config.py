@@ -106,3 +106,15 @@ def test_kv_calib_merge(tmp_path):
     out.write_text(json.dumps(merged))
     sc = kv_scales_from_file(str(out), headroom=2.0)
     assert sc[2]["k"] == pytest.approx(8.0 / 448.0)
+
+
+def test_qat_covers_every_nvfp4_moe_layer():
+    cfg = TraceConfig(enabled=True, layers=[3, 4], ship_scales=True, qat=True)
+    env = resolve_trace_env(cfg, QWEN, {0, 5})
+    # Guidance on the selected layers, fake quantization on all NVFP4 MoE layers.
+    assert env["NRL_TRACE_FC1_LAYERS"] == "3:4"
+    assert env["NRL_TRACE_QAT"] == "1" and env["NRL_TRACE_QAT_LAYERS"] == "1:2:3:4"
+    assert env["NRL_TRACE_SHIP_SCALES"] == "1"
+    assert "NRL_TRACE_QAT" not in resolve_trace_env(
+        TraceConfig(enabled=True), QWEN, set()
+    )

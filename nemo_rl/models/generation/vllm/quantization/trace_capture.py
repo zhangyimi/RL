@@ -206,6 +206,7 @@ class TraceFc2CaptureMixin:
             row_stride=buf.shape[1] * buf.shape[2],
             bits=_LAYOUT.fc2_bits,
             record_width=_LAYOUT.moe_intermediate_size,
+            ship=_LAYOUT.ship_scales,
         )
         try:
             out = super().apply(hidden_states, *args, **kwargs)  # type: ignore[misc]

@@ -32,6 +32,9 @@ of the target code, block maxima are left alone so TE's scales do not move):
 * kv: NVFP4 quant->dequant of K/V before core attention, mirroring the rollout
   cache (trtllm-gen dequantizes to FP8, ``kv8``); ``kv_rtn`` is plain RTN.
 
+With QAT (``NRL_TRACE_QAT=1``) the routed experts run in BF16 and the same
+sites write the fake-quantized NVFP4 values instead (see the QAT section).
+
 All rewrites are straight-through: the gradient flows to the unguided input.
 """
 
@@ -123,6 +126,8 @@ def split_trace_rows(
     from nemo_rl.models.megatron import trace_probe
 
     trace_probe.on_microbatch(model)
+    if qat_enabled():
+        _install_qat(model)
     if not trace_layout.trace_requested():
         return routed_experts
     if _LAYOUT is None:
@@ -131,6 +136,7 @@ def split_trace_rows(
     total = int(getattr(model_config, "num_layers"))
     trace_probe.flush_apply_stats(_APPLY_STATS, _CALL)
     _FC2_GUIDE.clear()
+    _FC2_PROBS.clear()
     if routed_experts.shape[1] == total:
         # No trace rows were attached (no captured sample in this microbatch).
         _ROWS_FULL = _ROWS_LOCAL = _ROUTES_LOCAL = None
@@ -165,15 +171,41 @@ def _probing() -> bool:
 
 
 def _nudge(
-    x: torch.Tensor, mode: str, payload: torch.Tensor, valid: torch.Tensor
+    x: torch.Tensor,
+    mode: str,
+    payload: torch.Tensor,
+    valid: torch.Tensor,
+    dequant: bool = False,
+    scales: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, dict]:
     """Guided rewrite of ``x`` [M, K] from a record payload in ``mode``.
 
     ``lsb``/``b2`` payloads guide with the 1/2 low code bits; ``full`` records
-    (probe layers) guide with their mantissa bit, like ``lsb``.
+    (probe layers) guide with their mantissa bit, like ``lsb``. With
+    ``dequant`` (QAT) the result is the NVFP4 fake quantization itself; guided
+    rows then use the rollout's ``scales`` (per-token decode, E4M3 block) if given.
     """
     from nemo_rl.quantization.trace.codec import fp4_lsb_from_packed
 
+    if dequant:
+        from nemo_rl.quantization.trace.nudge_triton import nvfp4_fakequant_fast
+
+        tok, blk = scales if scales is not None else (None, None)
+        width = 2 if mode == "b2" else 1
+        guide = payload if mode in ("lsb", "b2") else fp4_lsb_from_packed(payload)
+        out, st = nvfp4_fakequant_fast(
+            x,
+            guide,
+            valid,
+            width=width,
+            rollout_token_scale=tok,
+            rollout_block_scale=blk,
+        )
+        stats = {"fast_calls": 1}
+        if os.environ.get(PROBE_DIR_ENV):
+            stats["flipped"] = int(st["flipped_t"])
+            stats["elements"] = x.numel()
+        return out, stats
     if x.is_cuda and USE_FUSED:
         from nemo_rl.quantization.trace.nudge_triton import trace_nudge_rowscaled_fast
 
@@ -202,15 +234,32 @@ def _nudge(
 
 
 def _apply_fc1_guidance(layer: int, hidden_states: torch.Tensor) -> torch.Tensor:
-    """Return ``hidden_states`` whose TE quantization yields the TRACE codes."""
+    """Return ``hidden_states`` whose TE quantization yields the TRACE codes.
+
+    Under QAT, return the fake-quantized (guided where recorded) values instead.
+    """
     rows = _ROWS_LOCAL
     shape = hidden_states.shape
     x = hidden_states.reshape(-1, shape[-1])
-    if rows is None or rows.shape[0] != x.shape[0] or layer not in _LAYOUT.fc1_records:
-        return hidden_states
+    qat = _qat_layer(layer)
+    if (
+        _LAYOUT is None
+        or "fc1" not in _modes()
+        or rows is None
+        or rows.shape[0] != x.shape[0]
+        or layer not in _LAYOUT.fc1_records
+    ):
+        return _qat_fq(x).view(shape) if qat else hidden_states
     dec = trace_layout.decode_fc1(_LAYOUT, rows, layer)
+    scales = (
+        (dec.token_scale, dec.block_scale)
+        if qat and dec.token_scale is not None
+        else None
+    )
     with torch.no_grad():
-        x_new, stats = _nudge(x.detach(), dec.mode, dec.codes, dec.valid)
+        x_new, stats = _nudge(
+            x.detach(), dec.mode, dec.codes, dec.valid, dequant=qat, scales=scales
+        )
     acc = _APPLY_STATS.setdefault(("fc1", layer), collections.Counter())
     acc.update(stats)
     acc["calls"] += 1
@@ -232,8 +281,9 @@ def _install_fc1_patch() -> None:
     def preprocess(self, hidden_states, probs, routing_map):
         # Routing (and shared experts) already consumed the unguided hidden
         # states; only the copy dispatched to the routed experts is guided.
-        if _LAYOUT is not None:
-            hidden_states = _apply_fc1_guidance(self.layer_number - 1, hidden_states)
+        layer = self.layer_number - 1
+        if (_LAYOUT is not None and "fc1" in _modes()) or _qat_layer(layer):
+            hidden_states = _apply_fc1_guidance(layer, hidden_states)
         return orig(self, hidden_states, probs, routing_map)
 
     MoELayer.preprocess = preprocess
@@ -433,6 +483,8 @@ def _install_attention_hooks(model: Any) -> None:
 
 # layer -> (code rows, valid rows, unpadded tokens per local expert)
 _FC2_GUIDE: dict[int, tuple[torch.Tensor, torch.Tensor, list[int]]] = {}
+# layer -> router probs folded into the fc2 input rows (QAT with shipped scales)
+_FC2_PROBS: dict[int, torch.Tensor] = {}
 _FC2_REC_BYTES_IDS = 2  # int16 expert id (+1, 0 = none) per top-k slot
 
 
@@ -611,8 +663,9 @@ def _pad_guide_to_splits(lsb, valid, unpadded: list[int], padded: list[int]):
 
 def _fc2_pre_hook(layer: int, x: torch.Tensor, m_splits) -> torch.Tensor:
     guide = _FC2_GUIDE.get(layer)
+    qat = _qat_layer(layer)
     if guide is None:
-        return x
+        return _qat_fq(x) if qat else x
     lsb, valid, unpadded = guide
     padded = list(m_splits) if m_splits is not None else unpadded
     if len(padded) != len(unpadded) or sum(padded) != x.shape[0]:
@@ -622,6 +675,23 @@ def _fc2_pre_hook(layer: int, x: torch.Tensor, m_splits) -> torch.Tensor:
         )
     payload, valid = _pad_guide_to_splits(lsb, valid, unpadded, padded)
     mode = _LAYOUT.fc2_mode
+    scales = None
+    if _LAYOUT.ship_scales:
+        # Slot = [code bits | fp32 per-token decode scale | E4M3 block scales].
+        cb = _LAYOUT.fc2_code_bytes
+        tok = payload[:, cb : cb + 4].contiguous().view(torch.float32).view(-1)
+        blk = payload[:, cb + 4 :].contiguous().view(torch.float8_e4m3fn)
+        payload = payload[:, :cb]
+        probs = _FC2_PROBS.get(layer)
+        if qat and probs is not None:
+            # The rollout quantizes SwiGLU(fc1) and applies the router prob
+            # after GEMM2; training feeds p * SwiGLU(fc1) to fc2.
+            probs = probs.reshape(-1, 1).float()
+            if probs.shape[0] != x.shape[0]:
+                ones = torch.ones_like(probs[:, 0], dtype=torch.bool)
+                probs, _ = _pad_guide_to_splits(probs, ones, unpadded, padded)
+            tok = tok * probs.view(-1)
+        scales = (tok, blk)
     acc = _APPLY_STATS.setdefault(("fc2", layer), collections.Counter())
     acc["rows"] += x.shape[0]
     if _probing():
@@ -629,9 +699,16 @@ def _fc2_pre_hook(layer: int, x: torch.Tensor, m_splits) -> torch.Tensor:
 
         trace_probe.fc2_probe_stats(acc, x, payload, valid, mode)
     if "fc2" not in _modes():
-        return x
+        return _qat_fq(x) if qat else x
     with torch.no_grad():
-        x_new, stats = _nudge(x.detach(), mode, payload, valid)
+        x_new, stats = _nudge(
+            x.detach(),
+            mode,
+            payload,
+            valid,
+            dequant=qat,
+            scales=scales if qat else None,
+        )
     acc.update(stats)
     # Row-scaled NVFP4 is (up to bf16 rounding of p * act) invariant to the
     # per-row router prob, so the prob-weighted fc2 input can be guided with
@@ -684,6 +761,7 @@ def _install_fc2_hooks(model: Any) -> None:
             module._nrl_trace_fc2_hook = True
             layer = module.layer_number - 1
             module.token_dispatcher._nrl_trace_layer = layer
+            module.experts._nrl_trace_layer = layer
 
             def pre(mod, args, layer=layer):
                 splits = args[1] if len(args) > 1 else None
@@ -692,3 +770,134 @@ def _install_fc2_hooks(model: Any) -> None:
                 return (_fc2_pre_hook(layer, args[0], splits), *args[1:])
 
             module.experts.linear_fc2.register_forward_pre_hook(pre)
+
+
+# -- QAT: BF16 expert GEMMs on NVFP4 fake-quantized operands -------------------
+#
+# With ``NRL_TRACE_QAT=1`` the routed experts run in BF16 (TE recipe without
+# NVFP4, e.g. examples/te_precision/all_bf16_trace_qat.yaml) and the trainer
+# fake-quantizes what the rollout quantizes: the fc1 and fc2 inputs (per-token
+# NVFP4, TRACE-guided where recorded) and the expert weights (per-tensor NVFP4,
+# as the refit quantizer). Activations use a straight-through estimator;
+# weights are replaced in place by their fake quantization once per optimizer
+# step, so the forward sees q(w) while the FP32 main parameters take the
+# gradient (STE on the weights).
+
+QAT_ENV = "NRL_TRACE_QAT"
+QAT_LAYERS_ENV = "NRL_TRACE_QAT_LAYERS"
+_QAT_EPOCH = 0
+_QAT_INSTALLED = False
+
+
+def qat_enabled() -> bool:
+    return os.environ.get(QAT_ENV) == "1"
+
+
+def _qat_layer(layer: int) -> bool:
+    if not qat_enabled():
+        return False
+    sel = os.environ.get(QAT_LAYERS_ENV, "")
+    return not sel or layer in trace_layout._parse_layers(sel)
+
+
+def _qat_fq(x: torch.Tensor) -> torch.Tensor:
+    """Per-token NVFP4 fake quantization (round to nearest), straight-through."""
+    from nemo_rl.quantization.trace.nudge_triton import nvfp4_fakequant_fast
+
+    shape = x.shape
+    x2 = x.reshape(-1, shape[-1])
+    with torch.no_grad():
+        q, _ = nvfp4_fakequant_fast(x2.detach())
+    return (x2 + (q - x2).detach()).view(shape)
+
+
+@torch.no_grad()
+def _qat_quantize_weights(module: Any) -> None:
+    """Replace each expert weight by its per-tensor NVFP4 fake quantization.
+
+    Same scales as the rollout refit quantizer (``amax / (6 * 448)`` global,
+    E4M3 per 16 input elements); a gated fc1 is gate||up, matching the shared
+    W1/W3 global scale.
+    """
+    from nemo_rl.quantization.trace.nudge_triton import nvfp4_fakequant_fast
+
+    for name, p in module.named_parameters(recurse=False):
+        if not name.startswith("weight") or p.dim() != 2:
+            continue
+        amax = p.detach().abs().amax().float().clamp_min(1e-8)
+        q, _ = nvfp4_fakequant_fast(
+            p.detach(), global_encode=torch.reciprocal(amax / 2688.0)
+        )
+        p.data.copy_(q)
+
+
+def _install_qat(model: Any) -> None:
+    global _QAT_INSTALLED
+    if _QAT_INSTALLED:
+        return
+    from megatron.core.extensions.transformer_engine import TEGroupedLinear
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+    from megatron.core.transformer.moe.experts import TEGroupedMLP
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
+    def bump(cls):
+        orig = cls.__dict__["step"]
+
+        def step(self, *a, **k):
+            global _QAT_EPOCH
+            out = orig(self, *a, **k)
+            _QAT_EPOCH += 1
+            return out
+
+        cls.step = step
+
+    todo = [MegatronOptimizer]
+    while todo:
+        cls = todo.pop()
+        todo.extend(cls.__subclasses__())
+        if "step" in cls.__dict__:
+            bump(cls)
+
+    # Weights are fake-quantized inside forward: after the DDP pre-hook has
+    # finished this module's (overlapped) parameter all-gather.
+    orig_fwd = TEGroupedLinear.forward
+
+    def forward(self, x, m_splits, *a, **k):
+        if (
+            getattr(self, "_nrl_qat_layer", None) is not None
+            and self._nrl_qat_epoch != _QAT_EPOCH
+        ):
+            _qat_quantize_weights(self)
+            self._nrl_qat_epoch = _QAT_EPOCH
+        return orig_fwd(self, x, m_splits, *a, **k)
+
+    TEGroupedLinear.forward = forward
+
+    # Router probs of the fc2 input rows (rescales shipped fc2 scales).
+    orig_mlp_fwd = TEGroupedMLP.forward
+
+    def mlp_forward(self, hidden, tokens_per_expert, permuted_probs, *a, **k):
+        layer = getattr(self, "_nrl_trace_layer", None)
+        if layer is not None:
+            _FC2_PROBS[layer] = permuted_probs.detach()
+        return orig_mlp_fwd(self, hidden, tokens_per_expert, permuted_probs, *a, **k)
+
+    TEGroupedMLP.forward = mlp_forward
+
+    _install_fc1_patch()
+    _install_fc2_hooks(model)
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    n = 0
+    for chunk in chunks:
+        for module in chunk.modules():
+            if not isinstance(module, MoELayer):
+                continue
+            layer = module.layer_number - 1
+            if not _qat_layer(layer):
+                continue
+            for lin in (module.experts.linear_fc1, module.experts.linear_fc2):
+                lin._nrl_qat_layer = layer
+                lin._nrl_qat_epoch = -1
+            n += 1
+    _QAT_INSTALLED = True
+    print(f"[trace] QAT fake quantization on {n} MoE layers", flush=True)

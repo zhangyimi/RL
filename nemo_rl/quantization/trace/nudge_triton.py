@@ -24,6 +24,10 @@ bit ``(i * width) % 8`` of byte ``(i * width) // 8``):
 * ``width=2``: two low code bits, nearest magnitude code carrying them (b=2).
 * ``width=4``: packed E2M1 nibbles; ``match_bits`` 4 copies the code (sign
   included), 2/3 emulate b=2/b=3 from full codes.
+
+With ``DEQUANT`` the kernel instead writes the dequantized target codes (QAT
+fake quantization); ``HAS_GENC`` replaces the row amax by a given global
+encode scale (per-tensor weight quantization).
 """
 
 from __future__ import annotations
@@ -46,41 +50,91 @@ def _mag_of(c):
 
 
 @triton.jit
+def _rcp_approx(x):
+    return tl.inline_asm_elementwise(
+        "rcp.approx.ftz.f32 $0, $1;",
+        "=r,r",
+        [x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def _nudge_kernel(
     x_ptr,
     out_ptr,
     guide_ptr,
     valid_ptr,
     flips_ptr,
+    genc_ptr,
+    rtok_ptr,
+    rsf_ptr,
     K,
     guide_row_bytes,
     BLOCK_K: tl.constexpr,
     WIDTH: tl.constexpr,
     MATCH: tl.constexpr,
+    HAS_GUIDE: tl.constexpr = True,
+    DEQUANT: tl.constexpr = False,
+    HAS_GENC: tl.constexpr = False,
+    ROLL_SCALE: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_K)
     inb = offs < K
-    x_raw = tl.load(x_ptr + row * K + offs, mask=inb, other=0.0)
+    base = row.to(tl.int64) * K
+    x_raw = tl.load(x_ptr + base + offs, mask=inb, other=0.0)
     x = x_raw.to(tl.float32)
     ax = tl.abs(x)
     fp32_max = 3.4028234663852886e38
 
     # TE row-scaled NVFP4 scales (same op order as the torch reference).
-    row_amax = tl.max(ax, axis=0)
-    g_enc = tl.minimum(
-        tl.math.div_rn(tl.zeros_like(row_amax) + 2688.0, row_amax), fp32_max
-    )
-    g_enc = tl.where(g_enc == 0.0, 1.0, g_enc)
+    if HAS_GENC:
+        g_enc = tl.load(genc_ptr).to(tl.float32)
+    else:
+        row_amax = tl.max(ax, axis=0)
+        g_enc = tl.minimum(
+            tl.math.div_rn(tl.zeros_like(row_amax) + 2688.0, row_amax), fp32_max
+        )
+        g_enc = tl.where(g_enc == 0.0, 1.0, g_enc)
     g_dec = tl.math.div_rn(tl.zeros_like(g_enc) + 1.0, g_enc)
     ax2 = tl.reshape(ax, (BLOCK_K // 16, 16))
     vmax = tl.max(ax2, axis=1)
     inv6 = 0.1666666716337204  # fp32(1/6) == torch.reciprocal(6.0)
-    dec = tl.minimum(vmax * (g_enc * inv6), fp32_max)
-    dec = tl.minimum(tl.maximum(dec, -448.0), 448.0)
-    dec = dec.to(tl.float8e4nv).to(tl.float32)
-    scale = dec * g_dec
-    enc = tl.minimum(tl.math.div_rn(tl.zeros_like(scale) + 1.0, scale), fp32_max)
+    if HAS_GENC:
+        # vLLM ``scaled_fp4_quant`` (the refit weight quantizer) arithmetic:
+        # approximate reciprocals decide exact E2M1 ties the same way.
+        ones = tl.zeros_like(vmax) + 1.0
+        dec = (ones * g_enc) * (vmax * _rcp_approx(ones * 6.0))
+        dec = tl.minimum(dec, 448.0).to(tl.float8e4nv).to(tl.float32)
+        enc = tl.where(dec == 0.0, 0.0, _rcp_approx(dec * _rcp_approx(ones * g_enc)))
+        scale = dec * g_dec
+    else:
+        dec = tl.minimum(vmax * (g_enc * inv6), fp32_max)
+        dec = tl.minimum(tl.maximum(dec, -448.0), 448.0)
+        dec = dec.to(tl.float8e4nv).to(tl.float32)
+        scale = dec * g_dec
+        enc = tl.minimum(tl.math.div_rn(tl.zeros_like(scale) + 1.0, scale), fp32_max)
+    if HAS_GUIDE:
+        valid = tl.load(valid_ptr + row).to(tl.int1)
+    else:
+        valid = row < 0
+    if ROLL_SCALE:
+        # Guided rows quantize under the rollout's own scales (the paper's
+        # normalisation): per-token global decode scale + E4M3 block scales.
+        boffs = tl.arange(0, BLOCK_K // 16)
+        rdec = tl.load(
+            rsf_ptr + row.to(tl.int64) * (K // 16) + boffs,
+            mask=boffs < K // 16,
+            other=0,
+        )
+        rdec = rdec.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        rscale = rdec * tl.load(rtok_ptr + row)
+        renc = tl.minimum(tl.math.div_rn(tl.zeros_like(rscale) + 1.0, rscale), fp32_max)
+        scale = tl.where(valid, rscale, scale)
+        enc = tl.where(valid, renc, enc)
     is_max2 = ax2 == vmax[:, None]
     scale_e = tl.reshape(
         tl.broadcast_to(scale[:, None], (BLOCK_K // 16, 16)), (BLOCK_K,)
@@ -109,9 +163,12 @@ def _nudge_kernel(
     rtn = tl.where(on_grid | (mag < mid) | ((mag == mid) & ~tie_up), lower, upper)
 
     bit = offs * WIDTH
-    gbyte = tl.load(guide_ptr + row * guide_row_bytes + bit // 8, mask=inb, other=0).to(
-        tl.int32
-    )
+    if HAS_GUIDE:
+        gbyte = tl.load(
+            guide_ptr + row.to(tl.int64) * guide_row_bytes + bit // 8, mask=inb, other=0
+        ).to(tl.int32)
+    else:
+        gbyte = tl.zeros_like(offs)
     g = (gbyte >> (bit % 8)) & ((1 << WIDTH) - 1)
 
     if WIDTH == 1:
@@ -141,8 +198,10 @@ def _nudge_kernel(
         )
         guided = tl.minimum(guided, cap)
 
-    valid = tl.load(valid_ptr + row).to(tl.int1)
-    keep = (~valid) | is_max
+    if ROLL_SCALE:
+        keep = ~valid  # rollout scales are fixed: the block maximum may move too
+    else:
+        keep = (~valid) | is_max
     rtn_code = rtn | (neg.to(tl.int32) << 3)
     g_code = guided | (tsign.to(tl.int32) << 3)
     target = tl.where(keep, rtn_code, g_code)
@@ -151,8 +210,11 @@ def _nudge_kernel(
     tval = tl.where((target & 8) != 0, -tval, tval)
     centre = (tval * scale_e).to(x_raw.dtype)
     centre = tl.where((target & 7) == 0, 0.0, centre).to(x_raw.dtype)
-    out = tl.where(flip, centre, x_raw)
-    tl.store(out_ptr + row * K + offs, out, mask=inb)
+    if DEQUANT:
+        out = centre
+    else:
+        out = tl.where(flip, centre, x_raw)
+    tl.store(out_ptr + base + offs, out, mask=inb)
     tl.atomic_add(flips_ptr, tl.sum(flip.to(tl.int32), axis=0))
 
 
@@ -181,6 +243,9 @@ def trace_nudge_rowscaled_fast(
             guide_packed.contiguous(),
             guide_valid.to(torch.int8).contiguous(),
             flips,
+            flips,
+            flips,
+            flips,
             k,
             guide_packed.shape[1],
             BLOCK_K=triton.next_power_of_2(k),
@@ -188,6 +253,60 @@ def trace_nudge_rowscaled_fast(
             MATCH=match,
         )
     # Counters stay on device; callers that log them pay the sync.
+    return out, {"flipped_t": flips}
+
+
+def nvfp4_fakequant_fast(
+    x: torch.Tensor,
+    guide_packed: torch.Tensor | None = None,
+    guide_valid: torch.Tensor | None = None,
+    *,
+    width: int = 1,
+    global_encode: torch.Tensor | None = None,
+    rollout_token_scale: torch.Tensor | None = None,
+    rollout_block_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """NVFP4 quant->dequant of ``x`` [M, K], optionally TRACE-guided.
+
+    Row-scaled (per-token global scale from the row amax, TE formula) unless
+    ``global_encode`` (fp32 scalar tensor, ``448 * 6 / amax``) gives one
+    per-tensor scale. Guided rows (``guide_valid``) take the rollout-guided
+    code like :func:`trace_nudge_rowscaled_fast`; the rest round to nearest.
+    With ``rollout_token_scale`` ([M] fp32 global decode) and
+    ``rollout_block_scale`` ([M, K/16] E4M3), guided rows use those scales.
+    """
+    m, k = x.shape
+    if k % BLOCK:
+        raise ValueError(f"K={k} not a multiple of {BLOCK}")
+    x = x.contiguous()
+    out = torch.empty_like(x)
+    flips = torch.zeros(1, dtype=torch.int32, device=x.device)
+    has_guide = guide_packed is not None
+    roll = rollout_token_scale is not None
+    if roll and not has_guide:
+        raise ValueError("rollout scales apply to guided rows only")
+    if m:
+        _nudge_kernel[(m,)](
+            x,
+            out,
+            guide_packed.contiguous() if has_guide else x,
+            guide_valid.to(torch.int8).contiguous() if has_guide else x,
+            flips,
+            global_encode.to(torch.float32).reshape(1)
+            if global_encode is not None
+            else flips,
+            rollout_token_scale.to(torch.float32).contiguous() if roll else flips,
+            rollout_block_scale.contiguous().view(torch.uint8) if roll else flips,
+            k,
+            guide_packed.shape[1] if has_guide else 0,
+            BLOCK_K=triton.next_power_of_2(k),
+            WIDTH=width,
+            MATCH=width,
+            HAS_GUIDE=has_guide,
+            DEQUANT=True,
+            HAS_GENC=global_encode is not None,
+            ROLL_SCALE=roll,
+        )
     return out, {"flipped_t": flips}
 
 

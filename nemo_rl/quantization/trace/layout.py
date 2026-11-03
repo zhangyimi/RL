@@ -169,8 +169,14 @@ class TraceLayout:
         return _FC2_MODES[self.fc2_bits]
 
     @property
-    def fc2_slot_bytes(self) -> int:
+    def fc2_code_bytes(self) -> int:
         return self.code_bytes(self.moe_intermediate_size, self.fc2_mode)
+
+    @property
+    def fc2_slot_bytes(self) -> int:
+        """Code bits, then (ship_scales) fp32 per-token decode + E4M3 block scales."""
+        scales = 4 + self.moe_intermediate_size // 16 if self.ship_scales else 0
+        return self.fc2_code_bytes + scales
 
     @property
     def fc2_bytes(self) -> int:

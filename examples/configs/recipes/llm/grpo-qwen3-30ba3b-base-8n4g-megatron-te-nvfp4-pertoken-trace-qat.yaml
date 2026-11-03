@@ -1,0 +1,19 @@
+defaults: grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace.yaml
+# TRACE with QAT: the routed experts train in BF16 on NVFP4 fake-quantized
+# operands (every MoE layer); fc1/fc2 inputs follow the rollout's mantissa bit
+# and scales on the latter half of the layers.
+policy:
+  megatron_cfg:
+    te_precision_config_file: examples/te_precision/all_bf16_trace_qat.yaml
+  generation:
+    nvfp4_pertoken_rollout:
+      trace:
+        layers: [24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
+        ship_scales: true
+        qat: true
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace-qat
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace-qat
+  wandb:
+    name: grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace-qat

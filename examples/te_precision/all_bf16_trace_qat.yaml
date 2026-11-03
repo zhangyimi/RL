@@ -1,0 +1,13 @@
+# TRACE QAT (NRL_TRACE_QAT=1): every linear runs in BF16 under TE; the trainer
+# fake-quantizes the routed-expert operands to NVFP4 instead.
+configs:
+  bf16:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe: {}
+
+matchers:
+  all_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*"
+    enabled: true

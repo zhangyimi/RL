@@ -1725,7 +1725,9 @@ def _apply_precision_config(
     if per_token_rollout is not None:
         assert quant_recipe is not None
 
-        _validate_nvfp4_pertoken_precision_recipe(quant_recipe)
+        # TRACE QAT runs the routed experts in BF16 on fake-quantized operands.
+        if os.environ.get("NRL_TRACE_QAT") != "1":
+            _validate_nvfp4_pertoken_precision_recipe(quant_recipe)
 
         num_hidden_layers = getattr(
             model_cfg, "num_layers", getattr(model_cfg, "num_hidden_layers", None)

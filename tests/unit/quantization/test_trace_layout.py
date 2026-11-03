@@ -275,3 +275,18 @@ def test_capture_kv_into_matches_torch_encoder(monkeypatch, bits):
     need = lay.kv_bytes(rec.mode)
     assert torch.equal(got[valid, :need], ref[valid, :need])
     assert torch.equal(got[~valid, :4], ref[~valid, :4])
+
+
+def test_fc2_slot_with_shipped_scales(monkeypatch):
+    monkeypatch.setenv(L.FC2_LAYERS_ENV, "5")
+    monkeypatch.setenv(L.FC2_BITS_ENV, "1")
+    monkeypatch.setenv(L.SHIP_SCALES_ENV, "1")
+    lay = L.layout_from_env(
+        topk=8,
+        hidden_size=2048,
+        num_kv_heads=4,
+        head_dim=128,
+        moe_intermediate_size=768,
+    )
+    # 768 mantissa bits + fp32 per-token scale + 48 E4M3 block scales.
+    assert lay.fc2_code_bytes == 96 and lay.fc2_slot_bytes == 96 + 4 + 48
