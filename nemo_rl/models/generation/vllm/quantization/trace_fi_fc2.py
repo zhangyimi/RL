@@ -11,14 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FlashInfer TRT-LLM MoE overlay that exposes the fc2 input code bits.
+"""FlashInfer TRT-LLM MoE overlay that exposes the fc2 input FP4 record.
 
 With per-token NVFP4 activations the fc2 input (SwiGLU output) is quantized
 inside ``MoE::Runner::run`` (``trtllm_fused_moe_runner.cu``) into permuted rows
 that never reach Python. The overlay adds a small kernel after finalize that
-writes, for every expanded index ``e = token * top_k + k``, the packed code
-bits of that row straight into the token's TRACE record in the routed-experts
-transit buffer (marker included), so no further encode ops run per layer.
+writes, for every expanded index ``e = token * top_k + k``, the packed mantissa
+bits and the scales of that row straight into the token's TRACE record in the
+routed-experts transit buffer (marker included), so no further encode ops run
+per layer.
 
 The record pointer is passed through a process-global set by the exported
 ``nrl_trace_set_fc2_out`` before each layer's kernel call (and cleared
@@ -36,7 +37,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Optional
 
-MODULE_SUFFIX = "_nrltrace2"
+MODULE_SUFFIX = "_nrltrace3"
 _MODULE: Any = None
 _INSTALLED = False
 
@@ -46,9 +47,7 @@ _RUNNER_GLOBALS = r"""
 namespace nrl_trace {
 uint8_t* g_fc2_out = nullptr;  // record base (transit buffer + byte offset)
 int64_t g_fc2_row_stride = 0;  // bytes between consecutive tokens' records
-int g_fc2_bits = 1;            // 1: mantissa bit, 2: two low bits, 4: full code
 int32_t g_fc2_width = 0;       // record elements per slot (unpadded intermediate)
-int g_fc2_ship = 0;            // 1: append the row's per-token and block scales
 
 // Block-scale offsets of the swizzled layouts written by
 // invokeNvfp4QuantAndPerTokenScale (quantization_utils.cuh).
@@ -64,65 +63,51 @@ __device__ inline int64_t sfOffset8x4(int m, int k, int numColVecs) {
 
 // One block per expanded index e = token * topk + k. Row p of the permuted FP4
 // activation holds n/2 bytes (element 2i in the low nibble). The record of a
-// token is [marker x4 | slot k=0 | ... | slot k=topk-1], each slot w*bits/8
-// bytes for the first w <= n elements (n may carry kernel alignment padding);
-// element i sits at bit (i*bits)%8 of byte (i*bits)/8. With ``ship`` each
-// slot continues with the row's fp32 per-token decode scale and its w/16 E4M3
-// block scales (un-swizzled). Non-local experts (p < 0) get zeros.
+// token is [marker x4 | slot k=0 | ... | slot k=topk-1]; a slot covers the
+// first w <= n elements (n may carry kernel alignment padding):
+// [w/8 mantissa-bit bytes (element i at bit i%8 of byte i/8) | fp32 per-token
+// decode scale | w/16 E4M3 block scales (un-swizzled)]. Non-local experts
+// (p < 0) get zeros.
 __global__ void fc2CaptureKernel(int32_t numExpanded, int32_t topk, int32_t n, int32_t w,
-                                 int bits, int64_t rowStride, int32_t const* e2p,
-                                 uint8_t const* act, uint8_t* out, int ship,
-                                 float const* tokScale, uint8_t const* sf, int sf128) {
+                                 int64_t rowStride, int32_t const* e2p, uint8_t const* act,
+                                 uint8_t* out, float const* tokScale, uint8_t const* sf,
+                                 int sf128) {
   int32_t e = blockIdx.x;
   if (e >= numExpanded) return;
   int32_t tok = e / topk, k = e % topk;
   int32_t p = e2p[e];
-  int32_t nb = w * bits / 8;
+  int32_t nb = w / 8;
   int32_t nv = w / 16;
-  int32_t slot = nb + (ship ? 4 + nv : 0);
   uint8_t* rec = out + int64_t(tok) * rowStride;
   if (k == 0 && threadIdx.x < 4) rec[threadIdx.x] = 0xA5;
-  uint8_t* dst = rec + 4 + int64_t(k) * slot;
-  if (ship) {
-    uint8_t* sdst = dst + nb;
-    if (threadIdx.x < 4) {
-      float t = p >= 0 ? tokScale[p] : 0.f;
-      sdst[threadIdx.x] = reinterpret_cast<uint8_t const*>(&t)[threadIdx.x];
-    }
-    // Scale rows are laid out for the (possibly padded) kernel width n.
-    for (int32_t j = threadIdx.x; j < nv; j += blockDim.x) {
-      sdst[4 + j] =
-          p >= 0 ? sf[sf128 ? sfOffset128x4(p, j, n / 16) : sfOffset8x4(p, j, n / 16)] : 0;
-    }
-  }
+  uint8_t* dst = rec + 4 + int64_t(k) * (nb + 4 + nv);
   uint8_t const* src = act + int64_t(p) * (n / 2);
   for (int32_t j = threadIdx.x; j < nb; j += blockDim.x) {
     uint8_t b = 0;
     if (p >= 0) {
-      if (bits == 4) {
-        b = src[j];
-      } else if (bits == 2) {
-        uint16_t w = *reinterpret_cast<uint16_t const*>(src + int64_t(j) * 2);
+      uint32_t v = *reinterpret_cast<uint32_t const*>(src + int64_t(j) * 4);
 #pragma unroll
-        for (int i = 0; i < 4; ++i) b |= uint8_t(((w >> (4 * i)) & 3u) << (2 * i));
-      } else {
-        uint32_t w = *reinterpret_cast<uint32_t const*>(src + int64_t(j) * 4);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) b |= uint8_t(((w >> (4 * i)) & 1u) << i);
-      }
+      for (int i = 0; i < 8; ++i) b |= uint8_t(((v >> (4 * i)) & 1u) << i);
     }
     dst[j] = b;
+  }
+  uint8_t* sdst = dst + nb;
+  if (threadIdx.x < 4) {
+    float t = p >= 0 ? tokScale[p] : 0.f;
+    sdst[threadIdx.x] = reinterpret_cast<uint8_t const*>(&t)[threadIdx.x];
+  }
+  // Scale rows are laid out for the (possibly padded) kernel width n.
+  for (int32_t j = threadIdx.x; j < nv; j += blockDim.x) {
+    sdst[4 + j] =
+        p >= 0 ? sf[sf128 ? sfOffset128x4(p, j, n / 16) : sfOffset8x4(p, j, n / 16)] : 0;
   }
 }
 }  // namespace nrl_trace
 
-extern "C" void nrl_trace_set_fc2_out(void* p, int64_t stride, int bits, int32_t width,
-                                      int ship) {
+extern "C" void nrl_trace_set_fc2_out(void* p, int64_t stride, int32_t width) {
   nrl_trace::g_fc2_out = static_cast<uint8_t*>(p);
   nrl_trace::g_fc2_row_stride = stride;
-  nrl_trace::g_fc2_bits = bits;
   nrl_trace::g_fc2_width = width;
-  nrl_trace::g_fc2_ship = ship;
 }
 // ---------------------------------------------------------------------------
 """
@@ -135,7 +120,7 @@ _RUNNER_FINALIZE_ANCHOR = (
     "  }\n"
 )
 _RUNNER_CAPTURE = r"""
-  // NeMo-RL TRACE: capture fc2 input code bits (per-token NVFP4 path only).
+  // NeMo-RL TRACE: capture the fc2 input record (per-token NVFP4 path only).
   if (mUsePerTokenScalingGemm2 && ::nrl_trace::g_fc2_out != nullptr) {
     int32_t numExpanded = args.num_tokens * totalExpertsPerToken;
     int32_t width = ::nrl_trace::g_fc2_width;
@@ -143,11 +128,10 @@ _RUNNER_CAPTURE = r"""
                      "TRACE fc2 record width ", width, " exceeds intermediate size ",
                      args.intermediate_size);
     ::nrl_trace::fc2CaptureKernel<<<numExpanded, 128, 0, stream>>>(
-        numExpanded, totalExpertsPerToken, args.intermediate_size, width, ::nrl_trace::g_fc2_bits,
+        numExpanded, totalExpertsPerToken, args.intermediate_size, width,
         ::nrl_trace::g_fc2_row_stride,
         reinterpret_cast<int32_t const*>(workspace.expanded_idx_to_permuted_idx),
-        reinterpret_cast<uint8_t const*>(workspace.activation_output),
-        ::nrl_trace::g_fc2_out, ::nrl_trace::g_fc2_ship,
+        reinterpret_cast<uint8_t const*>(workspace.activation_output), ::nrl_trace::g_fc2_out,
         reinterpret_cast<float const*>(workspace.token_scales_fc2),
         reinterpret_cast<uint8_t const*>(workspace.activation_output_scale),
         mGemm2.mRunner.getSfLayoutB(config.gemm2Config) == btg::SfLayout::R128c4 ? 1 : 0);
@@ -155,13 +139,12 @@ _RUNNER_CAPTURE = r"""
 """
 _LAUNCHER_TAIL_ANCHOR = "}  // namespace flashinfer\n"
 _LAUNCHER_EXPORT = r"""
-extern "C" void nrl_trace_set_fc2_out(void* p, int64_t stride, int bits, int32_t width,
-                                      int ship);
+extern "C" void nrl_trace_set_fc2_out(void* p, int64_t stride, int32_t width);
 void nrl_trace_set_fc2_out_ffi(Optional<TensorView> buf, int64_t byte_offset, int64_t row_stride,
-                               int64_t bits, int64_t width, int64_t ship) {
+                               int64_t width) {
   nrl_trace_set_fc2_out(
       buf.has_value() ? static_cast<uint8_t*>(buf.value().data_ptr()) + byte_offset : nullptr,
-      row_stride, static_cast<int>(bits), static_cast<int32_t>(width), static_cast<int>(ship));
+      row_stride, static_cast<int32_t>(width));
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nrl_trace_set_fc2_out, nrl_trace_set_fc2_out_ffi);
 
@@ -277,23 +260,19 @@ def set_fc2_out(
     buf: Optional[Any],
     byte_offset: int = 0,
     row_stride: int = 0,
-    bits: int = 1,
     record_width: int = 0,
-    ship: bool = False,
 ) -> None:
     """Make the next MoE kernel launches write fc2 records into ``buf`` (or stop: None).
 
     ``buf`` is the contiguous uint8 transit buffer; token ``t``'s record starts
-    at byte ``byte_offset + t * row_stride``: ``[marker x4 | topk slots of
-    I*bits/8 bytes]`` (``layout.encode_fc2`` format), where ``I`` is
-    ``record_width``: the model's intermediate size, which the kernel may pad.
-    With ``ship`` each slot also carries the row's fp32 per-token decode scale
-    and its ``I/16`` E4M3 block scales (``layout.fc2_slot_bytes``).
+    at byte ``byte_offset + t * row_stride``: ``[marker x4 | topk slots]``
+    (``layout.fc2_slot_bytes`` each), where ``I`` = ``record_width`` is the
+    model's intermediate size, which the kernel may pad.
     """
     if _MODULE is None:
         if buf is None:
             return
         raise RuntimeError("TRACE fc2 overlay module is not loaded yet")
     _MODULE.nrl_trace_set_fc2_out(
-        buf, int(byte_offset), int(row_stride), int(bits), int(record_width), int(ship)
+        buf, int(byte_offset), int(row_stride), int(record_width)
     )

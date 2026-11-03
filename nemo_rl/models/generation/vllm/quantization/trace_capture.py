@@ -28,9 +28,8 @@ Hooks (installed by :func:`apply_trace_capture_patches`):
   tell the fc1/fc2 hooks inside the kernel call which layer they belong to.
 * fc1: vLLM's ``quantize_nvfp4_per_token_input`` as bound in the TRT-LLM
   NVFP4 experts module (no vLLM source patch).
-* fc2: ``TraceFc2CaptureMixin.apply`` on NeMo-RL's per-token experts class.
-* kv: ``FlashInferImpl.do_kv_cache_update`` reads the just-written NVFP4 cache
-  slots back (the cache itself is the ground truth for what attention reads).
+* fc2: ``TraceFc2CaptureMixin.apply`` on NeMo-RL's per-token experts class
+  (the FlashInfer overlay writes the record from inside the MoE kernel).
 
 All writes are fixed-shape device ops into a persistent buffer, so they are
 recorded correctly when vLLM captures CUDA graphs.
@@ -38,8 +37,6 @@ recorded correctly when vLLM captures CUDA graphs.
 
 from __future__ import annotations
 
-import os
-import re
 from typing import Any, Optional
 
 import torch
@@ -50,7 +47,6 @@ _CAPTURER: Any = None
 _LAYOUT: Optional[trace_layout.TraceLayout] = None
 _NUM_LAYERS: int = 0
 _CURRENT_MOE_LAYER: Optional[int] = None
-_LAYER_RE = re.compile(r"layers\.(\d+)\.")
 
 
 def register_capturer(capturer: Any, vllm_config: Any) -> None:
@@ -69,18 +65,17 @@ def register_capturer(capturer: Any, vllm_config: Any) -> None:
     if vllm_config.parallel_config.data_parallel_size != 1:
         raise RuntimeError("TRACE capture supports vLLM data_parallel_size=1 only")
     _CAPTURER, _LAYOUT, _NUM_LAYERS = capturer, layout, num_layers
-    if layout.fc2_records:
-        from nemo_rl.models.generation.vllm.quantization import trace_fi_fc2
+    from nemo_rl.models.generation.vllm.quantization import trace_fi_fc2
 
-        if not trace_fi_fc2._INSTALLED:
-            raise RuntimeError("TRACE fc2 capture requires the FlashInfer overlay")
-        if (
-            capturer.device_buffer.dtype != torch.uint8
-            or not capturer.device_buffer.is_contiguous()
-        ):
-            raise RuntimeError(
-                "TRACE fc2 capture writes records into a contiguous uint8 transit buffer"
-            )
+    if not trace_fi_fc2._INSTALLED:
+        raise RuntimeError("TRACE fc2 capture requires the FlashInfer overlay")
+    if (
+        capturer.device_buffer.dtype != torch.uint8
+        or not capturer.device_buffer.is_contiguous()
+    ):
+        raise RuntimeError(
+            "TRACE fc2 capture writes records into a contiguous uint8 transit buffer"
+        )
 
     _install_layer_tracking()
     _install_fc1_capture()
@@ -140,14 +135,6 @@ def _write(rec: trace_layout.SiteRecord, payload: torch.Tensor) -> None:
     buf[:n, row0 : row0 + rec.rows, :] = payload.to(buf.dtype)
 
 
-# Tests flip this to exercise the torch reference encoders.
-USE_FUSED_CAPTURE = True
-
-
-def _fast_capture() -> bool:
-    return USE_FUSED_CAPTURE
-
-
 def capture_fc1(
     packed_codes: torch.Tensor, block_scale: torch.Tensor, token_scale: torch.Tensor
 ) -> None:
@@ -158,24 +145,6 @@ def capture_fc1(
         return
     h = _LAYOUT.hidden_size
     n = packed_codes.shape[0]
-    buf = _CAPTURER.device_buffer
-    if (
-        _fast_capture()
-        and not _LAYOUT.ship_scales
-        and buf.is_cuda
-        and buf.dtype == torch.uint8
-    ):
-        # One kernel per layer instead of ~10 small encode ops per decode step.
-        from nemo_rl.quantization.trace.encode_triton import encode_fc1_into
-
-        encode_fc1_into(
-            buf,
-            (_NUM_LAYERS + rec.row_offset) * _LAYOUT.topk,
-            packed_codes.view(torch.uint8).reshape(n, -1),
-            rec.mode,
-            h,
-        )
-        return
     payload = trace_layout.encode_fc1(
         _LAYOUT,
         rec,
@@ -204,9 +173,7 @@ class TraceFc2CaptureMixin:
             buf,
             byte_offset=(_NUM_LAYERS + rec.row_offset) * _LAYOUT.topk,
             row_stride=buf.shape[1] * buf.shape[2],
-            bits=_LAYOUT.fc2_bits,
             record_width=_LAYOUT.moe_intermediate_size,
-            ship=_LAYOUT.ship_scales,
         )
         try:
             out = super().apply(hidden_states, *args, **kwargs)  # type: ignore[misc]
@@ -215,128 +182,10 @@ class TraceFc2CaptureMixin:
         return out
 
 
-def capture_kv(
-    impl: Any, layer: Any, kv_cache: torch.Tensor, slot_mapping: torch.Tensor
-) -> None:
-    """Read back the NVFP4 K/V records just written for this step's tokens."""
-    if _LAYOUT is None or not getattr(impl, "is_kvcache_nvfp4", False):
-        return
-    m = _LAYER_RE.search(getattr(layer, "layer_name", "") or "")
-    if m is None:
-        return
-    rec = _LAYOUT.kv_records.get(int(m.group(1)))
-    if rec is None:
-        return
-    hk = impl.num_kv_heads
-    if hk != _LAYOUT.num_kv_heads:
-        raise RuntimeError(
-            f"TRACE kv: layout has {_LAYOUT.num_kv_heads} KV heads, impl {hk}"
-        )
-    buf = _CAPTURER.device_buffer
-    if (
-        _fast_capture()
-        and buf.is_cuda
-        and buf.dtype == torch.uint8
-        and buf.is_contiguous()
-    ):
-        # One kernel per layer: gather codes/scales from the paged cache and
-        # write the encode_kv record in place.
-        from nemo_rl.quantization.trace.encode_triton import capture_kv_into
-
-        capture_kv_into(
-            buf,
-            (_NUM_LAYERS + rec.row_offset) * _LAYOUT.topk,
-            kv_cache,
-            slot_mapping,
-            hk,
-            _LAYOUT.head_dim,
-            rec.mode,
-        )
-        return
-    from vllm.utils.torch_utils import nvfp4_split_data_scale
-
-    n = slot_mapping.shape[0]
-    valid = slot_mapping >= 0
-    slots = slot_mapping.clamp(min=0)
-    block_size = kv_cache.shape[2]
-    blk, off = slots // block_size, slots % block_size
-    sides = []
-    # kv_cache: (num_blocks, 2 * Hkv, block_size, full_dim), K heads first.
-    for is_v, side in ((False, kv_cache[:, :hk]), (True, kv_cache[:, hk:])):
-        data, sf = nvfp4_split_data_scale(side)  # (B, Hkv, N, D/2), (B, Hkv, N, D/16)
-        sf = sf.view(torch.uint8)
-        if not is_v:
-            sides += [data[blk, :, off], sf[blk, :, off]]
-            continue
-        # V scales use TRT-LLM's 4-token interleave inside each (page, head)
-        # [N, S] tile: flat[(t//4)*4*S + s*4 + t%4] = scale[t, s]
-        # (FlashInfer nvfp4_quantize_paged_kv_cache). Un-swizzle per token.
-        s_dim = sf.shape[-1]
-        s_idx = torch.arange(s_dim, device=sf.device)
-        flat = (
-            (off // 4).unsqueeze(1) * (4 * s_dim) + s_idx * 4 + (off % 4).unsqueeze(1)
-        )
-        sf_t = sf.permute(0, 2, 3, 1)  # (B, N, S, Hkv)
-        v_sf = sf_t[blk.unsqueeze(1), flat // s_dim, flat % s_dim]  # (n, S, Hkv)
-        sides += [data[blk, :, off], v_sf.permute(0, 2, 1)]
-    payload = trace_layout.encode_kv(
-        _LAYOUT, rec, sides[0], sides[1], sides[2], sides[3], valid
-    )
-    _write(rec, payload[:n])
-
-
-# -- calibrated NVFP4 KV scales --------------------------------------------
-
-KV_SCALES_FILE_ENV = "NRL_TRACE_KV_SCALES_FILE"
-
-
-def on_bind(model: Any) -> None:
-    """Called before CUDA-graph capture: install calibrated KV scales.
-
-    vLLM leaves NVFP4 KV scales at 1.0 without a calibrated checkpoint, which
-    pushes small V blocks into E4M3 subnormals/zero. FlashInfer caches
-    ``bmm1/bmm2_scale`` on first forward, so reset them as well.
-    """
-    path = os.environ.get(KV_SCALES_FILE_ENV)
-    if not path:
-        return
-    from nemo_rl.quantization.trace.kv_calib import kv_scales_from_file
-
-    headroom = float(os.environ.get("NRL_TRACE_KV_SCALE_HEADROOM", "1.0"))
-    scales = kv_scales_from_file(path, headroom)
-    n = 0
-    for module in model.modules():
-        if not hasattr(module, "_k_scale") or not hasattr(module, "layer_name"):
-            continue
-        m = _LAYER_RE.search(module.layer_name or "")
-        if m is None or int(m.group(1)) not in scales:
-            continue
-        sc = scales[int(m.group(1))]
-        for name in ("k", "v", "q"):
-            getattr(module, f"_{name}_scale").fill_(sc[name])
-            setattr(module, f"_{name}_scale_float", sc[name])
-        module._k_scale_cpu = torch.tensor(sc["k"], dtype=torch.float32)
-        module._v_scale_cpu = torch.tensor(sc["v"], dtype=torch.float32)
-        impl = getattr(module, "impl", None)
-        if impl is not None:
-            for attr in ("bmm1_scale", "bmm2_scale"):
-                if hasattr(impl, attr):
-                    setattr(impl, attr, None)
-        n += 1
-    print(
-        f"[trace] calibrated NVFP4 KV scales installed on {n} attention layers",
-        flush=True,
-    )
-
-
 # -- source patches ---------------------------------------------------------
 
 _SHAPE_MARKER = "NeMo-RL patch (TRACE routed-experts extra rows)"
 _INIT_MARKER = "NeMo-RL patch (TRACE capturer registration)"
-_BIND_MARKER = "NeMo-RL patch (TRACE bind hook)"
-_KV_MARKER = "NeMo-RL patch (TRACE kv capture)"
-_OSCALE_MARKER = "NeMo-RL patch (NVFP4 KV fp8 output scale)"
-KV_OSCALE_ENV = "NRL_TRACE_KV_OSCALE"
 
 
 def _patch_routed_experts_capturer(logger) -> None:
@@ -367,22 +216,10 @@ def _patch_routed_experts_capturer(logger) -> None:
         "            dtype=(torch.uint8 if extra_rows_for_vllm_config(vllm_config) else torch.int32),\n"
         "            device=current_platform.device_type,\n"
     )
-    bind_old = (
-        '    """Attach capture callbacks to the target model\'s MoE routers."""\n'
-    )
-    bind_new = (
-        bind_old + f"    # {_BIND_MARKER}\n"
-        "    from nemo_rl.models.generation.vllm.quantization import trace_capture\n"
-        "    trace_capture.on_bind(model)\n"
-    )
     with _locked_file_patch(path) as (content, write_back):
-        if (
-            _SHAPE_MARKER in content
-            and _INIT_MARKER in content
-            and _BIND_MARKER in content
-        ):
+        if _SHAPE_MARKER in content and _INIT_MARKER in content:
             return
-        for old in (shape_old, init_old, bind_old, dtype_old):
+        for old in (shape_old, init_old, dtype_old):
             if content.count(old) != 1:
                 raise RuntimeError(
                     f"TRACE patch anchor not found exactly once in {path}: {old!r}"
@@ -390,7 +227,6 @@ def _patch_routed_experts_capturer(logger) -> None:
         content = (
             content.replace(shape_old, shape_new, 1)
             .replace(init_old, init_new, 1)
-            .replace(bind_old, bind_new, 1)
             .replace(dtype_old, dtype_new, 1)
         )
         # extra_rows_for_vllm_config is referenced inside __init__ for the dtype.
@@ -404,142 +240,8 @@ def _patch_routed_experts_capturer(logger) -> None:
     logger.info("Patched routed_experts_capturer.py for TRACE capture.")
 
 
-def _patch_flashinfer_kv_update(logger) -> None:
-    from nemo_rl.models.generation.vllm.patches import (
-        _get_vllm_file,
-        _locked_file_patch,
-    )
-
-    path = _get_vllm_file("v1/attention/backends/flashinfer.py")
-    old = (
-        "                self.cache_dtype,\n"
-        "                layer._k_scale,\n"
-        "                layer._v_scale,\n"
-        "            )\n"
-        "\n"
-        "\n"
-        "def fast_plan_decode("
-    )
-    new = (
-        "                self.cache_dtype,\n"
-        "                layer._k_scale,\n"
-        "                layer._v_scale,\n"
-        "            )\n"
-        f"            # {_KV_MARKER}\n"
-        "            from nemo_rl.models.generation.vllm.quantization import trace_capture\n"
-        "            trace_capture.capture_kv(self, layer, kv_cache, slot_mapping)\n"
-        "\n"
-        "\n"
-        "def fast_plan_decode("
-    )
-    with _locked_file_patch(path) as (content, write_back):
-        if _KV_MARKER in content:
-            return
-        if content.count(old) != 1:
-            raise RuntimeError(
-                f"TRACE kv patch anchor not found exactly once in {path}"
-            )
-        write_back(content.replace(old, new, 1))
-    logger.info("Patched flashinfer.py do_kv_cache_update for TRACE kv capture.")
-
-
-def _patch_flashinfer_out_scale(logger) -> None:
-    """Give the NVFP4-KV attention output a scale.
-
-    With an NVFP4 KV cache trtllm-gen only writes FP8 output, and vLLM stores
-    it unscaled (``bmm2_scale = v_scale``) before casting back to BF16. Qwen3's
-    attention outputs are mostly < 2^-6, i.e. FP8 subnormals (up to ~27%
-    error). The output is a convex combination of V rows, so ``|O| <= 448 *
-    v_scale``: use ``v_scale`` as the output scale and multiply it back.
-    """
-    from nemo_rl.models.generation.vllm.patches import (
-        _get_vllm_file,
-        _locked_file_patch,
-    )
-
-    path = _get_vllm_file("v1/attention/backends/flashinfer.py")
-    os_expr = "getattr(self, '_nrl_os', 1.0)"
-    init_old = (
-        "            if is_quantized_kv_cache(self.kv_cache_dtype):\n"
-        "                self.bmm2_scale *= layer._v_scale_float\n"
-    )
-    init_new = (
-        init_old + f"            # {_OSCALE_MARKER}\n"
-        "            if self.is_kvcache_nvfp4:\n"
-        "                self._nrl_os = layer._v_scale_float\n"
-        "                self.bmm2_scale /= self._nrl_os\n"
-    )
-    # FP8-output copy sites differ per vLLM version; exactly one set must match.
-    copy_sets = {
-        "0.29": [
-            (
-                "].copy_(out_prefill.to(output.dtype))",
-                "].copy_(out_prefill.to(output.dtype)",
-            ),
-            (
-                "].copy_(out[:num_prefill_tokens].to(output.dtype))",
-                "].copy_(out[:num_prefill_tokens].to(output.dtype)",
-            ),
-            (
-                "output[:num_decode_tokens].copy_(out_decode.to(output.dtype))",
-                "output[:num_decode_tokens].copy_(out_decode.to(output.dtype)",
-            ),
-            (
-                "output[:num_decode_tokens].copy_(out.to(output.dtype))",
-                "output[:num_decode_tokens].copy_(out.to(output.dtype)",
-            ),
-        ],
-        "0.31": [
-            ("].copy_(out_prefill)\n", "].copy_(out_prefill.to(output.dtype)"),
-            (
-                "].copy_(out[:num_prefill_tokens])\n",
-                "].copy_(out[:num_prefill_tokens].to(output.dtype)",
-            ),
-            (
-                "output[:num_decode_tokens].copy_(out_decode)\n",
-                "output[:num_decode_tokens].copy_(out_decode.to(output.dtype)",
-            ),
-            (
-                "output[:num_decode_tokens].copy_(out)\n",
-                "output[:num_decode_tokens].copy_(out.to(output.dtype)",
-            ),
-        ],
-    }
-    with _locked_file_patch(path) as (content, write_back):
-        if _OSCALE_MARKER in content:
-            return
-        if content.count(init_old) != 1:
-            raise RuntimeError(
-                f"NVFP4 out-scale anchor not found exactly once in {path}"
-            )
-        content = content.replace(init_old, init_new, 1)
-        matched = [
-            version
-            for version, copies in copy_sets.items()
-            if all(content.count(old) == 1 for old, _ in copies)
-        ]
-        if len(matched) != 1:
-            raise RuntimeError(
-                f"NVFP4 out-scale copy anchors matched vLLM layouts {matched} in {path}"
-            )
-        for old, head in copy_sets[matched[0]]:
-            tail = "\n" if old.endswith("\n") else ""
-            content = content.replace(old, f"{head} * {os_expr}){tail}")
-        # FlashInfer wrapper paths take v_scale directly instead of bmm2_scale.
-        content = content.replace(
-            "v_scale=layer._v_scale_float,",
-            f"v_scale=layer._v_scale_float / {os_expr},",
-        )
-        write_back(content)
-    logger.info("Patched flashinfer.py: scaled FP8 attention output for NVFP4 KV.")
-
-
 def apply_trace_capture_patches(logger) -> None:
     """Install the source patches when ``NRL_TRACE_*`` requests capture."""
     if not trace_layout.trace_requested():
         return
     _patch_routed_experts_capturer(logger)
-    if os.environ.get(trace_layout.KV_LAYERS_ENV):
-        _patch_flashinfer_kv_update(logger)
-    if os.environ.get(KV_OSCALE_ENV) == "1":
-        _patch_flashinfer_out_scale(logger)

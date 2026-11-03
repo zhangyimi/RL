@@ -65,22 +65,3 @@ def unpack_bits(packed: torch.Tensor) -> torch.Tensor:
 def fp4_lsb_from_packed(packed: torch.Tensor) -> torch.Tensor:
     """Packed NVFP4 data ``[..., K/2]`` -> packed mantissa-bit mask ``[..., K/8]``."""
     return pack_bits(unpack_fp4_nibbles(packed) & 1)
-
-
-def fp4_low2_from_packed(packed: torch.Tensor) -> torch.Tensor:
-    """Packed NVFP4 ``[..., K/2]`` -> low two code bits ``[..., K/4]``.
-
-    Element ``4j + t`` occupies bits ``2t, 2t+1`` of byte ``j`` (b=2 TRACE).
-    """
-    c = (unpack_fp4_nibbles(packed) & 3).unflatten(-1, (-1, 4))
-    return (c << (2 * _shifts(c.device)[:4])).sum(dim=-1, dtype=torch.uint8)
-
-
-def low2_to_packed_codes(low2: torch.Tensor) -> torch.Tensor:
-    """Inverse view of :func:`fp4_low2_from_packed`.
-
-    ``[..., K/4]`` -> packed nibbles ``[..., K/2]`` whose codes carry only the
-    two low bits.
-    """
-    c = ((low2.unsqueeze(-1) >> (2 * _shifts(low2.device)[:4])) & 3).flatten(-2)
-    return pack_fp4_nibbles(c)

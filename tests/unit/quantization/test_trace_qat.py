@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from nemo_rl.quantization.trace.codec import fp4_lsb_from_packed, unpack_fp4_nibbles
-from nemo_rl.quantization.trace.guided_quant import (
+from tests.unit.quantization.trace_reference import (
     dequantize_rowscaled_ref,
     nvfp4_rowscaled_quantize_ref,
 )
@@ -54,29 +54,6 @@ def test_fakequant_rtn_matches_reference(k):
     )
 
 
-@pytest.mark.parametrize("k", [2048, 768])
-def test_fakequant_guided_codes_match_nudge(k):
-    from nemo_rl.quantization.trace.nudge_triton import (
-        nvfp4_fakequant_fast,
-        trace_nudge_rowscaled_fast,
-    )
-
-    m = 300
-    x = _x(m, k, 2)
-    g = torch.Generator("cuda").manual_seed(3)
-    roll = (x.float() * (1 + 0.3 * torch.randn(m, k, device="cuda", generator=g))).to(
-        torch.bfloat16
-    )
-    lsb = fp4_lsb_from_packed(nvfp4_rowscaled_quantize_ref(roll).data)
-    valid = torch.rand(m, device="cuda", generator=g) > 0.1
-    nudged, st_n = trace_nudge_rowscaled_fast(x, lsb, valid, width=1)
-    got, st_f = nvfp4_fakequant_fast(x, lsb, valid, width=1)
-    assert int(st_f["flipped_t"]) == int(st_n["flipped_t"]) > 0
-    # Fake-quant of x under guidance == plain fake-quant of the nudged input.
-    rtn_of_nudged, _ = nvfp4_fakequant_fast(nudged)
-    assert torch.equal(got.view(torch.int16), rtn_of_nudged.view(torch.int16))
-
-
 @pytest.mark.parametrize("shape", [(1536, 2048), (2048, 768)])
 def test_weight_fakequant_keeps_amax_and_is_idempotent(shape):
     from nemo_rl.quantization.trace.nudge_triton import nvfp4_fakequant_fast
@@ -97,10 +74,11 @@ def test_weight_fakequant_keeps_amax_and_is_idempotent(shape):
     assert torch.equal(twice.view(torch.int16), once.view(torch.int16))
 
 
-def test_fakequant_with_rollout_scales_matches_reference():
+@pytest.mark.parametrize("k", [2048, 768])
+def test_fakequant_with_rollout_scales_matches_reference(k):
     from nemo_rl.quantization.trace.nudge_triton import nvfp4_fakequant_fast
 
-    m, k = 300, 2048
+    m = 300
     x = _x(m, k, 5)
     g = torch.Generator("cuda").manual_seed(6)
     roll = (x.float() * (1 + 0.05 * torch.randn(m, k, device="cuda", generator=g))).to(
@@ -126,6 +104,24 @@ def test_fakequant_with_rollout_scales_matches_reference():
         )
     )
     torch.testing.assert_close(got.float()[valid], ref[valid], rtol=2**-8, atol=0)
+    # Guidance moved some codes away from round-to-nearest.
+    rtn = dequantize_rowscaled_ref(
+        nvfp4_rowscaled_quantize_ref(
+            x,
+            rollout_decode_scale=rq.decode_scale,
+            rollout_token_scale=rq.global_decode,
+        )
+    )
+    assert (rtn[valid] != ref[valid]).any()
     # Unguided rows keep the trainer's own round-to-nearest.
     own, _ = nvfp4_fakequant_fast(x)
     assert torch.equal(got[~valid].view(torch.int16), own[~valid].view(torch.int16))
+
+
+def test_guidance_needs_rollout_scales():
+    from nemo_rl.quantization.trace.nudge_triton import nvfp4_fakequant_fast
+
+    x = _x(8, 64, 7)
+    lsb = torch.zeros(8, 8, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError):
+        nvfp4_fakequant_fast(x, lsb, torch.ones(8, dtype=torch.bool, device="cuda"))

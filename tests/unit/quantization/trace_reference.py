@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Rollout-guided E2M1 rounding (TRACE, arXiv 2610.07767), reference version.
+"""Torch reference for the TRACE NVFP4 fake quantization kernel (tests only).
+
+Rollout-guided E2M1 rounding (TRACE, arXiv 2610.07767).
 
 TRACE replaces round-to-nearest with: of the two E2M1 codewords bracketing the
 scaled training value, take the one closer to the rollout codeword. Adjacent
@@ -33,7 +35,11 @@ from typing import Optional
 
 import torch
 
-from nemo_rl.quantization.trace.codec import pack_fp4_nibbles, unpack_bits
+from nemo_rl.quantization.trace.codec import (
+    pack_fp4_nibbles,
+    unpack_bits,
+    unpack_fp4_nibbles,
+)
 
 FP4_MAX = 6.0
 E4M3_MAX = 448.0
@@ -86,22 +92,6 @@ def guided_e2m1(
         mag_code = torch.where(on_grid, rtn, guided)
     sign = (scaled < 0).to(torch.uint8) << 3
     return mag_code.to(torch.uint8) | sign, rtn.to(torch.uint8) | sign
-
-
-def nearest_code_with_low_bits(
-    scaled: torch.Tensor, low: torch.Tensor, bits: int
-) -> torch.Tensor:
-    """Magnitude code (0..7) nearest to ``|scaled|`` whose low ``bits`` equal ``low``.
-
-    Ties go to the smaller code. This is b>=2 TRACE guidance: with two bits an
-    off-by-two rollout code is still recoverable. Returns int64 magnitude codes.
-    """
-    mags = torch.tensor(E2M1_MAGNITUDES, device=scaled.device, dtype=torch.float32)
-    mask = (1 << bits) - 1
-    codes8 = torch.arange(8, device=scaled.device)
-    ok = (codes8 & mask) == (low.to(torch.int64) & mask).unsqueeze(-1)
-    dist = (mags - scaled.abs().unsqueeze(-1)).abs()
-    return torch.where(ok, dist, torch.full_like(dist, float("inf"))).argmin(-1)
 
 
 @dataclass
@@ -200,9 +190,7 @@ def nvfp4_rowscaled_quantize_ref(
 
 
 def dequantize_rowscaled_ref(q: NVFP4RowScaled, dtype=torch.float32) -> torch.Tensor:
-    """Dequantize a :class:`NVFP4RowScaled` (for tests and STE fake-quant)."""
-    from nemo_rl.quantization.trace.codec import unpack_fp4_nibbles
-
+    """Dequantize a :class:`NVFP4RowScaled`."""
     codes = unpack_fp4_nibbles(q.data)
     mags = torch.tensor(E2M1_MAGNITUDES, device=codes.device, dtype=torch.float32)
     vals = mags[(codes & 7).long()]
@@ -211,93 +199,3 @@ def dequantize_rowscaled_ref(q: NVFP4RowScaled, dtype=torch.float32) -> torch.Te
     global_decode = (q.row_amax / (E4M3_MAX * FP4_MAX)).view(m, 1, 1)
     scale = q.decode_scale.to(torch.float32).view(m, k // BLOCK, 1) * global_decode
     return (vals.view(m, k // BLOCK, BLOCK) * scale).view(m, k).to(dtype)
-
-
-def trace_nudge_rowscaled(
-    x: torch.Tensor,
-    guide_lsb_packed: Optional[torch.Tensor],
-    guide_valid: torch.Tensor,
-    guide_codes_packed: Optional[torch.Tensor] = None,
-    guide_bits: int = 4,
-) -> tuple[torch.Tensor, dict]:
-    """Rewrite ``x`` so TE's own row-scaled RTN quantization yields TRACE codes.
-
-    TE quantizes routed-expert inputs after the token dispatcher, where the
-    rollout guidance is not available. Instead of plumbing guidance through
-    dispatch and TE, each element whose TRACE code differs from its RTN code
-    is replaced by the centre of its TRACE codeword (far from any rounding
-    boundary). Block maxima are never touched, so the per-row amax and every
-    E4M3 block scale are unchanged and TE reproduces exactly the guided codes.
-    Use as ``x + (x_new - x).detach()`` for the straight-through gradient.
-
-    With ``guide_codes_packed`` (full rollout codes, ``[M, K/2]``) the target
-    is the rollout code itself rather than the bracket neighbour with the
-    rollout mantissa bit (the "copy" upper bound for b=4), capped at the
-    block maximum's code so scales stay unchanged. ``guide_bits`` < 4 keeps
-    only the low bits of each rollout magnitude code and picks the nearest
-    magnitude code carrying them (emulates b=2/3 guidance; sign from training).
-
-    Returns ``(x_new, stats)``; ``stats["unreproduced"]`` counts elements
-    whose re-quantization of ``x_new`` still differs from the TRACE codes
-    (expected 0).
-    """
-    m, k = x.shape
-    q = nvfp4_rowscaled_quantize_ref(x)  # TE-identical scales and RTN codes
-    global_decode = q.global_decode.view(m, 1, 1)
-    scale = q.decode_scale.to(torch.float32).view(m, k // BLOCK, 1) * global_decode
-    xb = x.view(m, k // BLOCK, BLOCK)
-    is_block_max = xb.abs() == xb.abs().amax(dim=-1, keepdim=True)
-
-    encode = torch.minimum(
-        torch.div(1.0, scale),
-        torch.tensor(torch.finfo(torch.float32).max, device=x.device),
-    )
-    scaled = (xb.to(torch.float32) * encode).clamp(-FP4_MAX, FP4_MAX).view(m, k)
-    if guide_codes_packed is None:
-        guide = unpack_bits(guide_lsb_packed)[:, :k]
-        guided, rtn = guided_e2m1(scaled, guide)
-    else:
-        from nemo_rl.quantization.trace.codec import unpack_fp4_nibbles
-
-        _, rtn = guided_e2m1(scaled)
-        guided = unpack_fp4_nibbles(guide_codes_packed)[:, :k]
-        if guide_bits < 4:
-            mag_code = nearest_code_with_low_bits(scaled, guided, guide_bits).to(
-                torch.uint8
-            )
-            guided = mag_code | ((scaled < 0).to(torch.uint8) << 3)
-        # Never exceed the block maximum's code: that would move the amax/scale.
-        cap = (rtn & 7).view(m, k // BLOCK, BLOCK).amax(dim=-1, keepdim=True)
-        mag = torch.minimum(guided & 7, cap.expand(m, k // BLOCK, BLOCK).reshape(m, k))
-        guided = mag | (guided & 8)
-    keep = (~guide_valid.view(m, 1)) | is_block_max.view(m, k)
-    target = torch.where(keep, rtn, guided)
-    flip = target != rtn
-
-    mags = torch.tensor(E2M1_MAGNITUDES, device=x.device, dtype=torch.float32)
-    tval = mags[(target & 7).long()]
-    tval = torch.where((target & 8) != 0, -tval, tval)
-    centre = (tval.view(m, k // BLOCK, BLOCK) * scale).view(m, k).to(x.dtype)
-    # A zero target becomes +0: TE encodes -0.0 with the sign bit and the
-    # reference cast does not; both mean 0, so pick the unambiguous one.
-    centre = torch.where((target & 7) == 0, torch.zeros_like(centre), centre)
-    x_new = torch.where(flip, centre, x)
-
-    check = nvfp4_rowscaled_quantize_ref(x_new)
-    from nemo_rl.quantization.trace.codec import unpack_fp4_nibbles
-
-    # Signed zeros compare equal numerically; ignore code 0 vs 8.
-    got = unpack_fp4_nibbles(check.data)
-    unrep = (got != target) & ~(((got & 7) == 0) & ((target & 7) == 0))
-    stats = {
-        "elements": m * k,
-        "guided_tokens": int(guide_valid.sum()),
-        "flipped": int(flip.sum()),
-        "unreproduced": int(unrep.sum()),
-        "scale_changed": int(
-            (
-                check.decode_scale.view(torch.uint8) != q.decode_scale.view(torch.uint8)
-            ).sum()
-        ),
-    }
-    return x_new, stats

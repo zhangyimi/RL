@@ -36,8 +36,7 @@ uv run --no-sync examples/run_grpo.py \
 
 grep -q "\[trace\] rollout capture active" "$RUN_LOG"
 grep -q "\[trace\] FlashInfer TRT-LLM MoE routed through the fc2-capture overlay" "$RUN_LOG"
-grep -q "\[trace\] fc1 guidance applied in MoELayer.preprocess" "$RUN_LOG"
-grep -q "\[trace\] fc2 hooks installed" "$RUN_LOG"
+grep -q "\[trace\] QAT fake quantization on" "$RUN_LOG"
 
 uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 

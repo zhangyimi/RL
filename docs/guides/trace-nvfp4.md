@@ -1,36 +1,34 @@
-# TRACE: Rollout-Guided NVFP4 Rounding
+# TRACE: Rollout-Guided NVFP4 QAT
 
-TRACE ([arXiv 2610.07767](https://arxiv.org/abs/2610.07767)) reduces the mismatch between the NVFP4 rollout and the NVFP4 training forward of MoE models.
+TRACE ([arXiv 2610.07767](https://arxiv.org/abs/2610.07767)) reduces the mismatch between the NVFP4 rollout and the training forward of MoE models.
 
 ## How It Works
 
-- During generation, vLLM records the lowest bit of every FP4 activation code at the selected quantization points. Neighboring FP4 values alternate this bit, so it tells which of the two nearest FP4 values the rollout rounded to.
-- In the training forward, Megatron rounds the same element to the neighbor with that bit instead of rounding to nearest. Gradients pass straight through.
-- The quantization points are the inputs of the two routed-expert GEMMs (`fc1`, `fc2`) and, optionally, the NVFP4 KV cache (`kv`).
-
-**Difference from the paper: scales are not sent.** The paper trains with fake quantization (QAT), so it can also store the rollout's quantization scales and use them to pick and to dequantize each code. Here training runs the real Transformer Engine NVFP4 kernels, which compute their own scales and do not take external ones. Only the bits are sent, so only the rounding direction is matched. Using the rollout's scales would need fake-quant training, or a TE path that accepts pre-quantized inputs.
+- Training uses QAT: the routed experts run in BF16 on NVFP4 fake-quantized weights and activations, the same quantization the per-token NVFP4 rollout applies.
+- During generation, vLLM records, for the inputs of the two routed-expert GEMMs (`fc1`, `fc2`), the lowest bit of every FP4 code plus the per-token and block scales. Neighboring FP4 values alternate this bit, so it tells which of the two nearest FP4 values the rollout rounded to.
+- In the training forward, on the guided layers, each element is quantized with the rollout's scales and rounded to the neighbor with the rollout's bit instead of to nearest. Gradients pass straight through.
+- Following the paper, guidance covers the latter half of the MoE layers by default; fake quantization covers all of them.
 
 ## Requirements
 
-- Per-token NVFP4 rollout (`generation.nvfp4_pertoken_rollout.enabled: true`) with Megatron TE NVFP4 training.
+- Per-token NVFP4 rollout (`generation.nvfp4_pertoken_rollout.enabled: true`) with Megatron training.
+- A TE precision recipe that keeps the routed experts in BF16 (`examples/te_precision/all_bf16_trace_qat.yaml`); the trainer checks this.
 - Router replay (`policy.router_replay.enabled: true`).
 - vLLM tensor parallel size 1, synchronous vLLM engine (`vllm_cfg.async_engine: false`), GRPO.
-- On the first run, FlashInfer JIT-compiles a patched TRT-LLM MoE module that exposes the `fc2` codes, which takes about 15 minutes. Point `FLASHINFER_WORKSPACE_BASE` (in `vllm_cfg.env_vars`) at a shared directory to reuse the build.
+- On the first run, FlashInfer JIT-compiles a patched TRT-LLM MoE module that exposes the `fc2` codes and scales, which takes about 15 minutes. Point `FLASHINFER_WORKSPACE_BASE` (in `vllm_cfg.env_vars`) at a shared directory to reuse the build.
 
 ## Configuration
 
 ```yaml
 policy:
+  megatron_cfg:
+    te_precision_config_file: examples/te_precision/all_bf16_trace_qat.yaml
   generation:
     nvfp4_pertoken_rollout:
       enabled: true
       trace:
         enabled: true
-        sites: [fc1, fc2]   # add kv to also guide the NVFP4 KV cache
-        bits: 1             # 2 ships two low code bits (experimental)
-        layers: all         # or a list of decoder-layer indices
-        qat: false          # true: BF16 experts on fake-quantized NVFP4 (QAT)
-        ship_scales: false  # with qat: guided rows use the rollout's scales
+        layers: latter_half   # "all", or a list of decoder-layer indices
 ```
 
 Ready-made recipes:
@@ -38,37 +36,19 @@ Ready-made recipes:
 - `examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace.yaml`
 - `examples/configs/recipes/llm/grpo-nemotron35-lightning-30ba3b-8n4g-megatron-te-nvfp4-pertoken-trace.yaml`
 
-The Qwen3 recipe already has the settings of the 400-step runs below: 400 steps, every MoE layer in NVFP4, validation every 20 steps, synchronous vLLM scheduling, and `num_gpu_blocks_override: 16000` (only limits memory).
-
-Run TRACE on `fc1` and `fc2`:
+The Qwen3 recipe has the settings of the runs below: every MoE layer in NVFP4, validation every 20 steps, synchronous vLLM scheduling, and `num_gpu_blocks_override: 16000` (only limits memory).
 
 ```sh
 uv run examples/run_grpo.py \
   --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace.yaml
 ```
 
-Add the NVFP4 KV cache with the bundled Qwen3 scales:
-
-```sh
-uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace.yaml \
-  "policy.generation.nvfp4_pertoken_rollout.trace.sites=[fc1,fc2,kv]" \
-  ++policy.generation.nvfp4_pertoken_rollout.trace.kv.scales_file=examples/trace/kv_amax_qwen3_30b_a3b_base.json
-```
-
-Train with QAT instead of real NVFP4: the routed experts run in BF16 on NVFP4 fake-quantized weights and activations, and the guided rows use the rollout's own scales (`ship_scales: true`). The QAT recipe guides the latter half of the layers:
-
-```sh
-uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace-qat.yaml
-```
-
-For the plain NVFP4 baseline, run the parent recipe. It does not have these settings, so pass them on the command line:
+For the plain NVFP4 baseline, run the parent recipe with the same settings:
 
 ```sh
 uv run examples/run_grpo.py \
   --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken.yaml \
-  grpo.max_num_steps=400 grpo.val_period=20 \
+  grpo.max_num_steps=1500 grpo.val_period=20 \
   policy.megatron_cfg.first_last_layers_bf16=false \
   ++policy.generation.vllm_kwargs.async_scheduling=false \
   ++policy.generation.vllm_kwargs.num_gpu_blocks_override=16000
@@ -76,39 +56,21 @@ uv run examples/run_grpo.py \
 
 ## Results
 
-Qwen3-30B-A3B-Base, GRPO on DAPO-Math-17K, 8 nodes × 4 GB200, 400 steps, one run per row.
+Qwen3-30B-A3B-Base, GRPO on DAPO-Math-17K, 8 nodes × 4 GB200, one run per row. The runs used the same method on an earlier NeMo-RL main (vLLM 0.29).
 
-- **Mismatch KL**: KL between the rollout and training log-probs of the generated tokens (`train/gen_kl_error`), median over steps 380–400. Lower means rollout and training agree better.
-- **AIME24**: validation accuracy at step 200 and at step 400.
+- **Mismatch KL**: KL between the rollout and training log-probs of the generated tokens (`train/gen_kl_error`), mean over the steps shown.
+- **AIME24**: validation accuracy, mean of the evaluations around the step shown.
 
-| Rollout / training precision | Mismatch KL (steps 380–400) | AIME24, step 200 | AIME24, step 400 |
-|---|---|---|---|
-| BF16 | 0.0004 | 0.348 | 0.426 |
-| NVFP4 W4A4 | 0.0058 | 0.336 | 0.398 |
-| NVFP4 W4A4 + TRACE 1-bit | 0.0010 | 0.164 | 0.332 |
-| NVFP4 W4A4 + NVFP4 KV, KV RTN in training | 0.0166 | 0.324 | 0.309 |
-| NVFP4 W4A4 + NVFP4 KV + TRACE 1-bit (incl. KV) | 0.0067 | 0.273 | 0.344 |
+| Rollout / training | Mismatch KL, steps 980–1000 | Mismatch KL, steps 1300–1340 | AIME24, step 1000 | AIME24, step 1500 |
+|---|---|---|---|---|
+| BF16 / BF16 | 0.0006 | 0.0006 | 0.54 | 0.55 |
+| NVFP4 / NVFP4 | 0.0123 | 0.0299 | 0.48 | collapsed at step ~1350 |
+| NVFP4 / TRACE QAT | 0.0005 | 0.0005 | 0.51 | 0.58 |
 
-TRACE brings the mismatch close to BF16. In these runs, validation accuracy did not improve: it trailed plain NVFP4 for most of the run.
-
-## NVFP4 KV Cache
-
-Adding `kv` to `sites` switches the rollout to an NVFP4 KV cache (`kv_cache_dtype: nvfp4`). Training then applies the same NVFP4 quantization to K and V before attention.
-
-- **The KV scale is per tensor, so it must be calibrated in advance.** Activations get a scale per token at run time, but the NVFP4 KV cache uses one fixed scale per layer for K and one for V (plus the usual 16-element block scales). With vLLM's default of 1.0, small V values underflow and the rollout degrades badly. To calibrate, run a short BF16-KV job with `trace.kv.calib_dir: <dir>`, merge the per-rank maxima, and point `trace.kv.scales_file` at the result:
-
-  ```sh
-  python -m nemo_rl.quantization.trace.kv_calib <dir> kv_amax.json
-  ```
-
-  Scales for Qwen3-30B-A3B-Base are in `examples/trace/kv_amax_qwen3_30b_a3b_base.json`.
-- The trtllm-gen attention kernel dequantizes the NVFP4 cache to FP8 and quantizes Q to FP8. Training mirrors the FP8 dequantization, but these FP8 steps leave an error floor that TRACE does not remove.
-- `trace.kv.mode: rtn` applies plain round-to-nearest NVFP4 to K/V in training instead (a quantization-aware-training baseline).
-- Per-token KV scales are not supported. They would need vLLM to store a scale per token in the cache, the attention kernel to read it, and training to mirror it.
-- KV support is validated on Qwen3-30B-A3B only.
+Plain NVFP4 training drifts from the rollout as training goes on and collapses; with TRACE QAT the mismatch stays at the BF16 level for all 1500 steps.
 
 ## Limitations
 
-- One bit cannot fix every element: when the training value is too far from the rollout value, neither neighbor matches. These cases grow with depth (Qwen3-30B-A3B `fc1`: 0.02% of elements at layer 4, about 4% at layer 40, more with the NVFP4 KV cache).
+- One bit cannot fix every element: when the training value is too far from the rollout value, neither neighbor matches. These cases grow with depth.
 - The rollout-side hooks patch vLLM and FlashInfer sources at fixed anchors. They are validated on the pinned vLLM nightly and FlashInfer 0.7, and fail loudly on a version they do not match.
 - The async vLLM engine and SingleController are not supported yet.

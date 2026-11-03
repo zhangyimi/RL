@@ -464,12 +464,11 @@ def build_router_replay_assignments(
 
     from nemo_rl.models.megatron import trace_apply
 
-    # TRACE rows ride on the routed-experts tensor; strip them (pre-SP, so
-    # attention sites keep the full sequence) before routes are consumed.
+    # TRACE rows ride on the routed-experts tensor; strip them before the
+    # routes are consumed.
     local_routed_experts = trace_apply.split_trace_rows(
         model, model_config, local_routed_experts, _split_for_sequence_parallel
     )
-    trace_apply.next_microbatch()
     local_routed_experts = _split_for_sequence_parallel(
         model_config, local_routed_experts
     )

@@ -422,38 +422,36 @@ def _apply_trace_config(
     )
     from nemo_rl.quantization.trace.config import resolve_trace_env
 
-    trace = rollout.trace
-    env = resolve_trace_env(trace, hf_config, boundary_layer_indices(bf16_ignore))
+    env = resolve_trace_env(
+        rollout.trace, hf_config, boundary_layer_indices(bf16_ignore)
+    )
     if not env:
         return
     generation_config = cast(dict[str, Any], policy_config["generation"])
     vllm_cfg = generation_config["vllm_cfg"]
-    if trace.enabled:
-        if entry_point != "grpo":
-            raise ValueError(
-                f"nvfp4_pertoken_rollout.trace supports GRPO only, got {entry_point}"
-            )
-        if vllm_cfg.get("async_engine"):
-            # The async engine (and SingleController) returns routed experts
-            # without the TRACE payload.
-            raise ValueError(
-                "nvfp4_pertoken_rollout.trace requires vllm_cfg.async_engine=false"
-            )
-        if vllm_cfg.get("tensor_parallel_size", 1) != 1:
-            raise ValueError(
-                "nvfp4_pertoken_rollout.trace requires vLLM tensor_parallel_size=1"
-            )
-        if not (policy_config.get("router_replay") or {}).get("enabled"):
-            raise ValueError(
-                "nvfp4_pertoken_rollout.trace rides on router replay; set "
-                "policy.router_replay.enabled=true"
-            )
-        vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
-        # Router replay's aux output on the pinned vLLM nightly asserts when
-        # the post-refit prefix-cache reset meets an in-flight async step.
-        vllm_kwargs.setdefault("async_scheduling", False)
-        if "kv" in trace.sites:
-            vllm_kwargs["kv_cache_dtype"] = "nvfp4"
+    if entry_point != "grpo":
+        raise ValueError(
+            f"nvfp4_pertoken_rollout.trace supports GRPO only, got {entry_point}"
+        )
+    if vllm_cfg.get("async_engine"):
+        # The async engine (and SingleController) returns routed experts
+        # without the TRACE payload.
+        raise ValueError(
+            "nvfp4_pertoken_rollout.trace requires vllm_cfg.async_engine=false"
+        )
+    if vllm_cfg.get("tensor_parallel_size", 1) != 1:
+        raise ValueError(
+            "nvfp4_pertoken_rollout.trace requires vLLM tensor_parallel_size=1"
+        )
+    if not (policy_config.get("router_replay") or {}).get("enabled"):
+        raise ValueError(
+            "nvfp4_pertoken_rollout.trace rides on router replay; set "
+            "policy.router_replay.enabled=true"
+        )
+    vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
+    # Router replay's aux output on the pinned vLLM nightly asserts when
+    # the post-refit prefix-cache reset meets an in-flight async step.
+    vllm_kwargs.setdefault("async_scheduling", False)
     megatron_cfg = cast(dict[str, Any], policy_config["megatron_cfg"])
     for cfg in (vllm_cfg, megatron_cfg):
         env_vars = cfg.get("env_vars") or {}

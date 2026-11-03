@@ -1519,13 +1519,19 @@ def _validate_te_precision_config(
                 )
 
 
-def _validate_nvfp4_pertoken_precision_recipe(quant_recipe: RecipeConfig) -> None:
-    """Check effective module precision under the outer NVFP4 autocast context."""
+def _validate_nvfp4_pertoken_precision_recipe(
+    quant_recipe: RecipeConfig, experts: str = "nvfp4"
+) -> None:
+    """Check effective module precision under the outer NVFP4 autocast context.
+
+    ``experts`` is the routed experts' expected precision: ``bf16`` under TRACE
+    QAT, which fake-quantizes their operands itself.
+    """
     expected_precision = {
         "decoder.layers.0.self_attention.linear_qkv": "bf16",
         "decoder.layers.0.self_attention.linear_proj": "bf16",
-        "decoder.layers.0.mlp.experts.linear_fc1": "nvfp4",
-        "decoder.layers.0.mlp.experts.linear_fc2": "nvfp4",
+        "decoder.layers.0.mlp.experts.linear_fc1": experts,
+        "decoder.layers.0.mlp.experts.linear_fc2": experts,
         "decoder.layers.0.mlp.linear_fc1": "bf16",
         "decoder.layers.0.mlp.linear_fc2": "bf16",
         "decoder.layers.0.mlp.shared_experts.linear_fc1": "bf16",
@@ -1726,8 +1732,10 @@ def _apply_precision_config(
         assert quant_recipe is not None
 
         # TRACE QAT runs the routed experts in BF16 on fake-quantized operands.
-        if os.environ.get("NRL_TRACE_QAT") != "1":
-            _validate_nvfp4_pertoken_precision_recipe(quant_recipe)
+        _validate_nvfp4_pertoken_precision_recipe(
+            quant_recipe,
+            experts="bf16" if os.environ.get("NRL_TRACE_QAT_LAYERS") else "nvfp4",
+        )
 
         num_hidden_layers = getattr(
             model_cfg, "num_layers", getattr(model_cfg, "num_hidden_layers", None)

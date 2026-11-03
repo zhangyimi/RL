@@ -20,7 +20,6 @@ use TE NVFP4 for policy computation, but its master/export weights and the
 refit transport remain BF16.
 """
 
-import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType, new_class
@@ -585,7 +584,6 @@ class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
         if trace_requested():
             assert self.experts_cls is not None
             self.experts_cls = trace_experts_cls(self.experts_cls)
-        if os.environ.get("NRL_TRACE_FC2_LAYERS"):
             # Runs in the vLLM worker process during model construction, i.e.
             # before FlashInfer loads its MoE module for the profile run.
             from nemo_rl.models.generation.vllm.quantization import trace_fi_fc2
