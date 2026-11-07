@@ -41,6 +41,8 @@ import queue
 import threading
 from typing import Any, Optional
 
+import os
+
 import numpy as np
 import torch
 
@@ -53,6 +55,8 @@ _CURRENT_MOE_LAYER: Optional[int] = None
 # Side transport: TRACE-only capture buffer [max_tokens, extra_rows, topk].
 _TRACE_BUF: Optional[torch.Tensor] = None
 _SIDE: Optional["SideStore"] = None
+# One Triton kernel per layer for the fc1 record (vs ~13 small torch kernels).
+_FUSED_FC1 = os.environ.get("NRL_TRACE_FC1_ENCODE", "triton") == "triton"
 
 
 def register_capturer(capturer: Any, vllm_config: Any) -> None:
@@ -365,6 +369,21 @@ def capture_fc1(
         return
     h = _LAYOUT.hidden_size
     n = packed_codes.shape[0]
+    if _FUSED_FC1:
+        from nemo_rl.quantization.trace.encode_triton import encode_fc1_into
+
+        buf, base = _target()
+        topk = _LAYOUT.topk
+        row0 = base + rec.row_offset
+        out = buf[:n].view(n, -1)[:, row0 * topk : (row0 + rec.rows) * topk]
+        encode_fc1_into(
+            out,
+            packed_codes.view(torch.uint8).reshape(n, -1),
+            block_scale.view(torch.uint8).reshape(n, -1),
+            token_scale,
+            h,
+        )
+        return
     payload = trace_layout.encode_fc1(
         _LAYOUT,
         rec,
