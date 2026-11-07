@@ -139,7 +139,21 @@ def _install_side_store_hook() -> None:
             )
         return pending
 
+    orig_begin = cls.begin_step
+
+    def begin_step(self, metadata):
+        # A generation bump follows a prefix-cache reset (e.g. after refit):
+        # cached prompt rows from older weights must not serve as donors.
+        if (
+            metadata is not None
+            and _SIDE is not None
+            and metadata.generation > getattr(self, "_generation", 0)
+        ):
+            _SIDE.reset_prefix_cache()
+        return orig_begin(self, metadata)
+
     cls.prepare_output = prepare_output
+    cls.begin_step = begin_step
     cls._nrl_trace_side = True
 
 
@@ -162,6 +176,9 @@ class SideStore:
         self._q: queue.Queue = queue.Queue()
         self._blocks: dict[str, dict[int, np.ndarray]] = {}
         self._spans: dict[str, list[tuple[int, int]]] = {}  # written positions
+        # (prompt tokens, rows, have) of computed prompts since the last
+        # prefix-cache reset: donors for later prefix-cache hits.
+        self._prompt_rows: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         self._err: Optional[BaseException] = None
         self.copied_bytes = 0
         threading.Thread(target=self._run, name="trace-side-store", daemon=True).start()
@@ -184,6 +201,9 @@ class SideStore:
         main.wait_event(done)
         self.copied_bytes += host.numel()
         self._q.put((done, host, src, list(request_ids), starts, qsl))
+
+    def reset_prefix_cache(self) -> None:
+        self._prompt_rows.clear()
 
     def _run(self) -> None:
         while True:
@@ -240,31 +260,45 @@ class SideStore:
             arrays.append(arr)
             haves.append(have)
             prompts.append(len(out.prompt_token_ids))
-        # Prefix-cache hits: copy the prompt rows from a request with the same
-        # prompt that computed them (same tokens, same weights => same codes).
-        donors: dict[tuple, list[int]] = {}
+        # Prefix-cache hits: position p of a prompt takes the rows of any
+        # request (this call, or an earlier one since the last prefix-cache
+        # reset) whose tokens agree on [0, p] -- same tokens, same weights =>
+        # same codes. Shared chat-template prefixes are reused across prompts.
+        donors = list(self._prompt_rows)
         for i, out in enumerate(outputs):
-            donors.setdefault(tuple(out.prompt_token_ids), []).append(i)
+            p = min(prompts[i], len(haves[i]))
+            donors.append((np.asarray(out.prompt_token_ids[:p]), arrays[i][:p], haves[i][:p]))
         filled = 0
-        for group in donors.values():
-            for i in group:
-                p = min(prompts[i], len(haves[i]))
-                miss = ~haves[i][:p]
-                if not miss.any():
+        for i, out in enumerate(outputs):
+            p = min(prompts[i], len(haves[i]))
+            miss = ~haves[i][:p]
+            if not miss.any():
+                continue
+            toks = np.asarray(out.prompt_token_ids[:p])
+            for d_toks, d_rows, d_have in donors:
+                m = min(p, len(d_toks))
+                neq = np.nonzero(toks[:m] != d_toks[:m])[0]
+                lcp = int(neq[0]) if len(neq) else m
+                if lcp == 0:
                     continue
-                for j in group:
-                    if j == i:
-                        continue
-                    pj = min(p, len(haves[j]))
-                    take = miss[:pj] & haves[j][:pj]
-                    if take.any():
-                        idx = np.nonzero(take)[0]
-                        arrays[i][idx] = arrays[j][idx]
-                        haves[i][idx] = True
-                        filled += len(idx)
-                        miss[:pj] &= ~take
-                    if not miss.any():
-                        break
+                take = miss[:lcp] & d_have[:lcp]
+                if take.any():
+                    idx = np.nonzero(take)[0]
+                    arrays[i][idx] = d_rows[idx]
+                    haves[i][idx] = True
+                    filled += len(idx)
+                    miss[:lcp] &= ~take
+                if not miss.any():
+                    break
+        # Keep each distinct computed prompt for later calls (until reset).
+        seen = {d[0].tobytes() for d in self._prompt_rows}
+        for i, out in enumerate(outputs):
+            p = min(prompts[i], len(haves[i]))
+            toks = np.asarray(out.prompt_token_ids[:p])
+            key = toks.tobytes()
+            if p and key not in seen and haves[i][:p].all():
+                seen.add(key)
+                self._prompt_rows.append((toks, arrays[i][:p].copy(), haves[i][:p].copy()))
         missing = int(sum((~h).sum() for h in haves))
         self._blocks.clear()
         self._spans.clear()

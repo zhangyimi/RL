@@ -117,3 +117,52 @@ def test_uncaptured_positions_are_zero_and_counted(monkeypatch):
     assert stats["missing"] == 10
     np.testing.assert_array_equal(arrays[0][:10], t[:10])
     assert not arrays[0][10:].any()
+
+
+def test_shared_template_prefix_across_prompts(monkeypatch):
+    """Different prompts sharing a 32-token chat template: the second prompt's
+    template positions come from the prefix cache and are filled from the first."""
+    tmpl = _truth(10, 32)
+    a = np.concatenate([tmpl, _truth(11, 30)])  # prompt 40 = 32 template + 8
+    b = np.concatenate([tmpl, _truth(12, 30)])
+    truth = {"0-a": a, "1-b": b}
+    pa = list(range(32)) + [100 + i for i in range(8)]
+    pb = list(range(32)) + [200 + i for i in range(8)]
+    steps = [[("0-a", 0, 40), ("1-b", 32, 8)]]
+    steps += [[("0-a", 40 + t, 1), ("1-b", 40 + t, 1)] for t in range(19)]
+    arrays, stats = _run(
+        monkeypatch, steps, [_out("0", pa, 20), _out("1", pb, 20)], truth
+    )
+    assert stats == {"prefix_filled": 32, "missing": 0}
+    np.testing.assert_array_equal(arrays[0], a[:59])
+    np.testing.assert_array_equal(arrays[1], b[:59])
+
+
+def test_prefix_donor_from_earlier_call_until_reset(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import trace_capture as tc
+
+    buf = torch.zeros((4096, R, K), dtype=torch.uint8, device="cuda")
+    monkeypatch.setattr(tc, "_TRACE_BUF", buf)
+    store = tc.SideStore(ROW)
+    p_rows = _truth(20, 16)
+    first = np.concatenate([p_rows, _truth(21, 8)])
+    second = np.concatenate([p_rows, _truth(22, 8)])
+
+    def step(rid, src, start, cnt):
+        buf[:cnt] = torch.from_numpy(src[start : start + cnt]).view(cnt, R, K).cuda()
+        store.on_step([rid], [start], [0, cnt])
+
+    prompt = list(range(16))
+    step("0-a", first, 0, 23)
+    arrays, stats = store.collect([_out("0", prompt, 8)])
+    assert stats["missing"] == 0
+    # Next call: same prompt served from the prefix cache.
+    step("1-b", second, 16, 7)
+    arrays, stats = store.collect([_out("1", prompt, 8)])
+    assert stats == {"prefix_filled": 16, "missing": 0}
+    np.testing.assert_array_equal(arrays[0], second[:23])
+    # After a prefix-cache reset the old rows must not be reused.
+    store.reset_prefix_cache()
+    step("2-c", second, 16, 7)
+    arrays, stats = store.collect([_out("2", prompt, 8)])
+    assert stats == {"prefix_filled": 0, "missing": 16}
