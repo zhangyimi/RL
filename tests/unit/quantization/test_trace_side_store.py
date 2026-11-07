@@ -166,3 +166,26 @@ def test_prefix_donor_from_earlier_call_until_reset(monkeypatch):
     step("2-c", second, 16, 7)
     arrays, stats = store.collect([_out("2", prompt, 8)])
     assert stats == {"prefix_filled": 0, "missing": 16}
+
+
+def test_pinned_ring_wraps_and_blocks():
+    import threading
+
+    from nemo_rl.models.generation.vllm.quantization.trace_capture import _PinnedRing
+
+    ring = _PinnedRing(100)
+    a, sa = ring.alloc(40)
+    b, sb = ring.alloc(40)
+    big, sbig = ring.alloc(60)  # over half the ring: own buffer
+    assert sbig is None and big.numel() == 60
+    ring.release(sa)
+    c, sc = ring.alloc(30)  # 20 left at the end, wraps to the freed front
+    assert sc == (0, 30)
+    got = []
+    t = threading.Thread(target=lambda: got.append(ring.alloc(30)[1]))
+    t.start()
+    t.join(0.2)
+    assert t.is_alive()  # [30, 40) and [80, 100) are too small
+    ring.release(sb)
+    t.join(5)
+    assert got == [(30, 60)]

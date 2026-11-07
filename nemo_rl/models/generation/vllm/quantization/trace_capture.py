@@ -37,11 +37,11 @@ recorded correctly when vLLM captures CUDA graphs.
 
 from __future__ import annotations
 
+import collections
+import os
 import queue
 import threading
 from typing import Any, Optional
-
-import os
 
 import numpy as np
 import torch
@@ -185,6 +185,8 @@ class SideStore:
         self._prompt_rows: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         self._err: Optional[BaseException] = None
         self.copied_bytes = 0
+        cap_mb = int(os.environ.get("NRL_TRACE_SIDE_PINNED_MB", "512"))
+        self._ring = _PinnedRing(cap_mb << 20)
         threading.Thread(target=self._run, name="trace-side-store", daemon=True).start()
 
     def on_step(self, request_ids, token_starts, query_start_loc) -> None:
@@ -194,17 +196,20 @@ class SideStore:
         if n <= 0:
             return
         starts = np.array(token_starts[:n_req], dtype=np.int64)
+        # Snapshot on the main stream (a D2D copy, ~us) so the next forward
+        # can overwrite the capture buffer without waiting for the D2H copy.
+        src = _side_source(n).clone()
+        nbytes = src.numel()
+        host, slot = self._ring.alloc(nbytes)
         main = torch.cuda.current_stream()
         with torch.cuda.stream(self._stream):
             self._stream.wait_stream(main)
-            src = _side_source(n)
-            host = src.to("cpu", non_blocking=True)
+            host.copy_(src.view(-1), non_blocking=True)
+            src.record_stream(self._stream)
             done = torch.cuda.Event()
             done.record(self._stream)
-        # GPU-side wait: the next forward must not overwrite rows mid-copy.
-        main.wait_event(done)
-        self.copied_bytes += host.numel()
-        self._q.put((done, host, src, list(request_ids), starts, qsl))
+        self.copied_bytes += nbytes
+        self._q.put((done, host, slot, list(request_ids), starts, qsl))
 
     def reset_prefix_cache(self) -> None:
         self._prompt_rows.clear()
@@ -213,11 +218,14 @@ class SideStore:
         while True:
             item = self._q.get()
             try:
-                done, host, _src, request_ids, starts, qsl = item
-                done.synchronize()
-                rows = host.numpy().reshape(host.shape[0], self.row_bytes)
-                for i, rid in enumerate(request_ids):
-                    self._write(rid, int(starts[i]), rows[qsl[i] : qsl[i + 1]])
+                done, host, slot, request_ids, starts, qsl = item
+                try:
+                    done.synchronize()
+                    rows = host.numpy().reshape(-1, self.row_bytes)
+                    for i, rid in enumerate(request_ids):
+                        self._write(rid, int(starts[i]), rows[qsl[i] : qsl[i + 1]])
+                finally:
+                    self._ring.release(slot)
             except BaseException as e:  # surfaced by collect()
                 self._err = e
             finally:
@@ -308,6 +316,49 @@ class SideStore:
         self._spans.clear()
         stats = {"prefix_filled": filled, "missing": missing}
         return arrays, stats
+
+
+class _PinnedRing:
+    """FIFO pinned host buffer for the side store's D2H copies.
+
+    Slots are released in allocation order by the store thread; ``alloc``
+    blocks while the ring is full. Requests larger than the ring get their own
+    pinned tensor.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self._buf = torch.empty(capacity, dtype=torch.uint8, pin_memory=True)
+        self._cap = capacity
+        self._live: "collections.deque[tuple[int, int]]" = collections.deque()
+        self._cv = threading.Condition()
+
+    def _fit(self, nbytes: int) -> Optional[int]:
+        if not self._live:
+            return 0
+        head, tail = self._live[-1][1], self._live[0][0]
+        if head >= tail:
+            if self._cap - head >= nbytes:
+                return head
+            return 0 if tail >= nbytes else None
+        return head if tail - head >= nbytes else None
+
+    def alloc(self, nbytes: int) -> tuple[torch.Tensor, Any]:
+        if nbytes > self._cap // 2:
+            return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True), None
+        with self._cv:
+            while (start := self._fit(nbytes)) is None:
+                self._cv.wait()
+            slot = (start, start + nbytes)
+            self._live.append(slot)
+        return self._buf[slot[0] : slot[1]], slot
+
+    def release(self, slot: Any) -> None:
+        if slot is None:
+            return
+        with self._cv:
+            assert self._live and self._live[0] == slot
+            self._live.popleft()
+            self._cv.notify_all()
 
 
 def _install_layer_tracking() -> None:
