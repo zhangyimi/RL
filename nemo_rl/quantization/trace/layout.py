@@ -146,6 +146,29 @@ def trace_requested() -> bool:
     return bool(_parse_layers(os.environ.get(LAYERS_ENV)))
 
 
+TRANSPORT_ENV = "NRL_TRACE_TRANSPORT"
+
+
+def transport() -> str:
+    """How the rollout payload leaves vLLM.
+
+    * ``side`` (default): a TRACE-only capture buffer, copied asynchronously
+      per engine step into a host store keyed by request and position; vLLM's
+      routed-experts output carries the routes only.
+    * ``r3``: extra rows on vLLM's routed-experts capture (original path).
+    * ``both``: ``r3`` plus the side store reading the same rows; the worker
+      checks the two bit for bit (validation only).
+    """
+    value = os.environ.get(TRANSPORT_ENV, "side")
+    if value not in ("side", "r3", "both"):
+        raise ValueError(f"{TRANSPORT_ENV}={value!r}; expected side, r3 or both")
+    return value
+
+
+def rides_on_r3() -> bool:
+    return trace_requested() and transport() in ("r3", "both")
+
+
 def layout_for_hf_config(hf_text_config) -> TraceLayout:
     """Layout from a HF text config (vLLM side)."""
     return layout_from_env(
@@ -159,6 +182,13 @@ def extra_rows_for_vllm_config(vllm_config) -> int:
     """Extra routed-experts rows for a vLLM engine (0 when TRACE is off)."""
     if not trace_requested():
         return 0
+    _check_tp(vllm_config)
+    if not rides_on_r3():
+        return 0
+    return layout_for_hf_config(vllm_config.model_config.hf_text_config).extra_rows
+
+
+def _check_tp(vllm_config) -> None:
     tp = int(vllm_config.parallel_config.tensor_parallel_size)
     if tp != 1:
         # Only TP rank 0's routed-experts reach the scheduler; fc2 shards on
@@ -166,7 +196,6 @@ def extra_rows_for_vllm_config(vllm_config) -> int:
         raise ValueError(
             f"TRACE capture requires vLLM tensor_parallel_size=1, got {tp}"
         )
-    return layout_for_hf_config(vllm_config.model_config.hf_text_config).extra_rows
 
 
 # -- payload encode (rollout) / decode (trainer) ----------------------------

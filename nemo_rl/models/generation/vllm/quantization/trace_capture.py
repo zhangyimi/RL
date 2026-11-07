@@ -37,8 +37,11 @@ recorded correctly when vLLM captures CUDA graphs.
 
 from __future__ import annotations
 
+import queue
+import threading
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 from nemo_rl.quantization.trace import layout as trace_layout
@@ -47,20 +50,25 @@ _CAPTURER: Any = None
 _LAYOUT: Optional[trace_layout.TraceLayout] = None
 _NUM_LAYERS: int = 0
 _CURRENT_MOE_LAYER: Optional[int] = None
+# Side transport: TRACE-only capture buffer [max_tokens, extra_rows, topk].
+_TRACE_BUF: Optional[torch.Tensor] = None
+_SIDE: Optional["SideStore"] = None
 
 
 def register_capturer(capturer: Any, vllm_config: Any) -> None:
     """Called from the patched ``RoutedExpertsCapturer.__init__``."""
-    global _CAPTURER, _LAYOUT, _NUM_LAYERS
+    global _CAPTURER, _LAYOUT, _NUM_LAYERS, _TRACE_BUF, _SIDE
     if not trace_layout.trace_requested():
         return
     layout = trace_layout.layout_for_hf_config(vllm_config.model_config.hf_text_config)
     num_layers = int(vllm_config.model_config.get_total_num_hidden_layers())
     buf_layers = int(capturer.device_buffer.shape[1])
-    if buf_layers != num_layers + layout.extra_rows:
+    on_r3 = trace_layout.rides_on_r3()
+    extra = layout.extra_rows if on_r3 else 0
+    if buf_layers != num_layers + extra:
         raise RuntimeError(
             f"TRACE: routed-experts buffer has {buf_layers} layer rows, expected "
-            f"{num_layers} + {layout.extra_rows}; the shape patch did not apply."
+            f"{num_layers} + {extra}; the shape patch did not apply."
         )
     if vllm_config.parallel_config.data_parallel_size != 1:
         raise RuntimeError("TRACE capture supports vLLM data_parallel_size=1 only")
@@ -69,21 +77,199 @@ def register_capturer(capturer: Any, vllm_config: Any) -> None:
 
     if not trace_fi_fc2._INSTALLED:
         raise RuntimeError("TRACE fc2 capture requires the FlashInfer overlay")
-    if (
+    if on_r3 and (
         capturer.device_buffer.dtype != torch.uint8
         or not capturer.device_buffer.is_contiguous()
     ):
         raise RuntimeError(
             "TRACE fc2 capture writes records into a contiguous uint8 transit buffer"
         )
+    if trace_layout.transport() != "r3":
+        if not on_r3:
+            _TRACE_BUF = torch.zeros(
+                (capturer.device_buffer.shape[0], layout.extra_rows, layout.topk),
+                dtype=torch.uint8,
+                device=capturer.device_buffer.device,
+            )
+        _SIDE = SideStore(layout.extra_rows * layout.topk)
+        _install_side_store_hook()
 
     _install_layer_tracking()
     _install_fc1_capture()
     print(
         f"[trace] rollout capture active: layout={layout.to_json()} "
-        f"extra_rows={layout.extra_rows}",
+        f"extra_rows={layout.extra_rows} transport={trace_layout.transport()}",
         flush=True,
     )
+
+
+def _target() -> tuple[torch.Tensor, int]:
+    """Capture buffer and the row of the first TRACE row in it."""
+    if _TRACE_BUF is not None:
+        return _TRACE_BUF, 0
+    return _CAPTURER.device_buffer, _NUM_LAYERS
+
+
+def _side_source(n: int) -> torch.Tensor:
+    """This step's TRACE rows ``[n, extra_rows, topk]`` (on the current stream)."""
+    if _TRACE_BUF is not None:
+        return _TRACE_BUF[:n]
+    return _CAPTURER.device_buffer[:n, _NUM_LAYERS:].contiguous()
+
+
+def _install_side_store_hook() -> None:
+    """Hand every engine step's TRACE rows to the side store.
+
+    ``prepare_output`` runs on the main stream right after the forward, with the
+    batch's request ids, per-request start positions and row boundaries -- the
+    same bookkeeping vLLM uses to file its routed-experts rows.
+    """
+    from vllm.distributed.aux_output_connector import worker as aux_worker
+
+    cls = aux_worker.AuxOutputWorkerConnector
+    if getattr(cls, "_nrl_trace_side", False):
+        return
+    orig = cls.prepare_output
+
+    def prepare_output(self, input_batch):
+        pending = orig(self, input_batch)
+        if pending is not None and _SIDE is not None:
+            _SIDE.on_step(
+                pending.request_ids, pending.token_starts, pending.query_start_loc
+            )
+        return pending
+
+    cls.prepare_output = prepare_output
+    cls._nrl_trace_side = True
+
+
+class SideStore:
+    """Host store of TRACE rows keyed by (vLLM request id, token position).
+
+    Per engine step: one async D2H of the step's rows on a copy stream (the main
+    stream only waits on the copy before the next forward overwrites the
+    buffer); a background thread files the rows by request and position. The
+    engine thread never touches payload bytes. Positions served from the
+    prefix cache are filled at collection time from a request with the same
+    prompt that computed them.
+    """
+
+    BLOCK = 256  # tokens per host block
+
+    def __init__(self, row_bytes: int) -> None:
+        self.row_bytes = row_bytes
+        self._stream = torch.cuda.Stream()
+        self._q: queue.Queue = queue.Queue()
+        self._blocks: dict[str, dict[int, np.ndarray]] = {}
+        self._spans: dict[str, list[tuple[int, int]]] = {}  # written positions
+        self._err: Optional[BaseException] = None
+        self.copied_bytes = 0
+        threading.Thread(target=self._run, name="trace-side-store", daemon=True).start()
+
+    def on_step(self, request_ids, token_starts, query_start_loc) -> None:
+        n_req = len(request_ids)
+        qsl = np.array(query_start_loc[: n_req + 1], dtype=np.int64)
+        n = int(qsl[-1])
+        if n <= 0:
+            return
+        starts = np.array(token_starts[:n_req], dtype=np.int64)
+        main = torch.cuda.current_stream()
+        with torch.cuda.stream(self._stream):
+            self._stream.wait_stream(main)
+            src = _side_source(n)
+            host = src.to("cpu", non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(self._stream)
+        # GPU-side wait: the next forward must not overwrite rows mid-copy.
+        main.wait_event(done)
+        self.copied_bytes += host.numel()
+        self._q.put((done, host, src, list(request_ids), starts, qsl))
+
+    def _run(self) -> None:
+        while True:
+            item = self._q.get()
+            try:
+                done, host, _src, request_ids, starts, qsl = item
+                done.synchronize()
+                rows = host.numpy().reshape(host.shape[0], self.row_bytes)
+                for i, rid in enumerate(request_ids):
+                    self._write(rid, int(starts[i]), rows[qsl[i] : qsl[i + 1]])
+            except BaseException as e:  # surfaced by collect()
+                self._err = e
+            finally:
+                self._q.task_done()
+
+    def _write(self, rid: str, pos: int, rows: np.ndarray) -> None:
+        blocks = self._blocks.setdefault(rid, {})
+        b, off, k = self.BLOCK, 0, len(rows)
+        while off < k:
+            p = pos + off
+            blk = blocks.get(p // b)
+            if blk is None:
+                blk = blocks[p // b] = np.zeros((b, self.row_bytes), np.uint8)
+            lo = p % b
+            m = min(b - lo, k - off)
+            blk[lo : lo + m] = rows[off : off + m]
+            off += m
+        self._spans.setdefault(rid, []).append((pos, pos + k))
+
+    def collect(self, outputs) -> tuple[list[Optional[np.ndarray]], dict[str, int]]:
+        """Rows ``[prompt+response-1, extra_rows*topk]`` per vLLM RequestOutput."""
+        self._q.join()
+        if self._err is not None:
+            err, self._err = self._err, None
+            raise RuntimeError("TRACE side store failed") from err
+        by_ext: dict[str, list[str]] = {}
+        for rid in self._blocks:
+            by_ext.setdefault(rid.rsplit("-", 1)[0], []).append(rid)
+        b = self.BLOCK
+        arrays, haves, prompts = [], [], []
+        for out in outputs:
+            n = len(out.prompt_token_ids) + len(out.outputs[0].token_ids) - 1
+            arr = np.zeros((max(n, 0), self.row_bytes), np.uint8)
+            have = np.zeros(max(n, 0), bool)
+            for rid in by_ext.get(out.request_id, ()):
+                for bi, blk in self._blocks[rid].items():
+                    lo = bi * b
+                    if lo >= n:
+                        continue
+                    hi = min(lo + b, n)
+                    arr[lo:hi] = blk[: hi - lo]
+                for s0, s1 in self._spans.get(rid, ()):
+                    have[s0 : min(s1, n)] = True
+            arrays.append(arr)
+            haves.append(have)
+            prompts.append(len(out.prompt_token_ids))
+        # Prefix-cache hits: copy the prompt rows from a request with the same
+        # prompt that computed them (same tokens, same weights => same codes).
+        donors: dict[tuple, list[int]] = {}
+        for i, out in enumerate(outputs):
+            donors.setdefault(tuple(out.prompt_token_ids), []).append(i)
+        filled = 0
+        for group in donors.values():
+            for i in group:
+                p = min(prompts[i], len(haves[i]))
+                miss = ~haves[i][:p]
+                if not miss.any():
+                    continue
+                for j in group:
+                    if j == i:
+                        continue
+                    pj = min(p, len(haves[j]))
+                    take = miss[:pj] & haves[j][:pj]
+                    if take.any():
+                        idx = np.nonzero(take)[0]
+                        arrays[i][idx] = arrays[j][idx]
+                        haves[i][idx] = True
+                        filled += len(idx)
+                        miss[:pj] &= ~take
+                    if not miss.any():
+                        break
+        missing = int(sum((~h).sum() for h in haves))
+        self._blocks.clear()
+        self._spans.clear()
+        stats = {"prefix_filled": filled, "missing": missing}
+        return arrays, stats
 
 
 def _install_layer_tracking() -> None:
@@ -130,8 +316,8 @@ def _install_fc1_capture() -> None:
 
 def _write(rec: trace_layout.SiteRecord, payload: torch.Tensor) -> None:
     n = payload.shape[0]
-    row0 = _NUM_LAYERS + rec.row_offset
-    buf = _CAPTURER.device_buffer
+    buf, base = _target()
+    row0 = base + rec.row_offset
     buf[:n, row0 : row0 + rec.rows, :] = payload.to(buf.dtype)
 
 
@@ -166,12 +352,12 @@ class TraceFc2CaptureMixin:
             return super().apply(hidden_states, *args, **kwargs)  # type: ignore[misc]
         from nemo_rl.models.generation.vllm.quantization import trace_fi_fc2
 
-        buf = _CAPTURER.device_buffer
+        buf, base = _target()
         # The kernel writes [marker | slots] straight into this layer's record
         # (layout.encode_fc2 format); the pointer is baked per layer under CUDA graphs.
         trace_fi_fc2.set_fc2_out(
             buf,
-            byte_offset=(_NUM_LAYERS + rec.row_offset) * _LAYOUT.topk,
+            byte_offset=(base + rec.row_offset) * _LAYOUT.topk,
             row_stride=buf.shape[1] * buf.shape[2],
             record_width=_LAYOUT.moe_intermediate_size,
         )

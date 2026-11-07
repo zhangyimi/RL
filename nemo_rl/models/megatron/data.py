@@ -379,6 +379,11 @@ def get_microbatch_iterator(
         - seq_dim_size: Sequence length dimension size
         - padded_seq_length: Padded sequence length for pipeline parallelism (may differ from seq_length)
     """
+    if "trace_refs" in data:
+        from nemo_rl.models.megatron.trace_apply import prefetch_trace_refs
+
+        prefetch_trace_refs(data["trace_refs"])
+
     micro_batch_size = mbs
     pad_factor = 1
     pad_full_seq_to = None

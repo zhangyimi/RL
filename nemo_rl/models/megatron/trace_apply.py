@@ -57,6 +57,7 @@ _FC2_GUIDE: dict[int, tuple[torch.Tensor, torch.Tensor, list[int]]] = {}
 _FC2_PROBS: dict[int, torch.Tensor] = {}
 _FC2_REC_BYTES_IDS = 2  # int16 expert id (+1, 0 = none) per top-k slot
 _QAT_EPOCH = 0
+_ATTACH_STATS = [0, 0.0, 0.0, 0, 0]
 _QAT_INSTALLED = False
 
 
@@ -74,6 +75,63 @@ def layout_for_megatron_config(cfg: Any) -> trace_layout.TraceLayout:
         hidden_size=int(cfg.hidden_size),
         moe_intermediate_size=int(cfg.moe_ffn_hidden_size),
     )
+
+
+class _Prefetcher:
+    """Fetch a rank's TRACE payloads in the background, once per batch.
+
+    The logprob and training passes of a step consume the same samples, so the
+    fetched arrays are kept until a batch with different refs arrives. Fetching
+    starts when the worker receives its data, overlapping the transfer with the
+    forward of the first microbatches.
+    """
+
+    def __init__(self) -> None:
+        import concurrent.futures
+
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=int(os.environ.get("NRL_TRACE_FETCH_THREADS", "4")),
+            thread_name_prefix="trace-fetch",
+        )
+        self._futs: dict = {}
+
+    def prefetch(self, refs) -> None:
+        import ray
+
+        live = [r for r in refs if r is not None]
+        keep = set(live)
+        for r in list(self._futs):
+            if r not in keep:
+                del self._futs[r]
+        new = [r for r in live if r not in self._futs]
+        # Small groups: one transfer request each, several in flight.
+        for i in range(0, len(new), 4):
+            chunk = new[i : i + 4]
+            fut = self._pool.submit(ray.get, chunk)
+            for j, r in enumerate(chunk):
+                self._futs[r] = (fut, j)
+
+    def get(self, refs) -> list:
+        import ray
+
+        out = []
+        for r in refs:
+            hit = self._futs.get(r)
+            out.append(hit[0].result()[hit[1]] if hit is not None else ray.get(r))
+        return out
+
+
+_PREFETCHER: Optional[_Prefetcher] = None
+
+
+def prefetch_trace_refs(refs) -> None:
+    """Start fetching all TRACE payloads of this rank's batch (non-blocking)."""
+    global _PREFETCHER
+    if refs is None or not trace_layout.trace_requested():
+        return
+    if _PREFETCHER is None:
+        _PREFETCHER = _Prefetcher()
+    _PREFETCHER.prefetch(refs)
 
 
 def attach_trace_rows(data_dict: Any) -> None:
@@ -95,20 +153,48 @@ def attach_trace_rows(data_dict: Any) -> None:
         return
     mb, seq, num_layers, topk = routes.shape
     live = [(i, r) for i, r in enumerate(refs) if r is not None]
-    arrays = ray.get([r for _, r in live]) if live else []
+    _prof = os.environ.get("NRL_TRACE_PROF") == "1"
+    if _prof:
+        import time
+
+        _t0 = time.perf_counter()
+    wanted = [r for _, r in live]
+    if _PREFETCHER is not None:
+        arrays = _PREFETCHER.get(wanted)
+    else:
+        arrays = ray.get(wanted) if live else []
+    if _prof:
+        _t1 = time.perf_counter()
     extra = next((a.shape[1] for a in arrays), None)
     if extra is None:
         if _LAYOUT is None:
             return
         extra = _LAYOUT.extra_rows
-    rows = torch.zeros((mb, seq, extra, topk), dtype=torch.uint8)
+    rows = torch.empty((mb, seq, extra, topk), dtype=torch.uint8)
+    filled = [0] * mb
     for (i, _), arr in zip(live, arrays):
         n = min(arr.shape[0], seq)
         rows[i, :n] = torch.from_numpy(arr[:n])
+        filled[i] = n
+    for i, n in enumerate(filled):
+        rows[i, n:] = 0
     rows = (
         rows.view(routes.dtype) if routes.element_size() == 1 else rows.to(routes.dtype)
     )
     data_dict["routed_experts"] = torch.cat([routes, rows], dim=2)
+    if _prof:
+        _ATTACH_STATS[0] += 1
+        _ATTACH_STATS[1] += _t1 - _t0
+        _ATTACH_STATS[2] += time.perf_counter() - _t1
+        _ATTACH_STATS[3] += sum(a.nbytes for a in arrays)
+        _ATTACH_STATS[4] += data_dict["routed_experts"].numel()
+        if _ATTACH_STATS[0] % 8 == 0:
+            n, g, b, nb, nel = _ATTACH_STATS
+            print(
+                f"[trace-prof] attach calls={int(n)} ray_get_s={g:.2f} build_s={b:.2f} "
+                f"fetched_GB={nb / 1e9:.3f} padded_GB={nel / 1e9:.3f}",
+                flush=True,
+            )
 
 
 def split_trace_rows(
