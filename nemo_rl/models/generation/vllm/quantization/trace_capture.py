@@ -37,6 +37,7 @@ recorded correctly when vLLM captures CUDA graphs.
 from __future__ import annotations
 
 import collections
+import concurrent.futures
 import queue
 import threading
 from typing import Any, Optional
@@ -155,6 +156,7 @@ class SideStore:
     SEG_BYTES = 1 << 30  # host arena segment
     BATCH_STEPS = 32  # engine steps per store-thread wakeup
     PINNED_BYTES = 512 << 20  # D2H staging ring
+    FILE_THREADS = 8  # collect-time row copies (numpy releases the GIL)
 
     def __init__(self, row_bytes: int) -> None:
         self.row_bytes = row_bytes
@@ -170,6 +172,9 @@ class SideStore:
         self._err: Optional[BaseException] = None
         self._ring = _PinnedRing(self.PINNED_BYTES)
         self._pending: list = []
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            self.FILE_THREADS, thread_name_prefix="trace-file"
+        )
         threading.Thread(target=self._run, name="trace-side-store", daemon=True).start()
 
     def on_step(self, request_ids, token_starts, query_start_loc) -> None:
@@ -272,13 +277,21 @@ class SideStore:
         _, last = np.unique(key[::-1], return_index=True)
         keep = len(key) - 1 - last
         req, pos, loc, seg = req[keep], pos[keep], loc[keep], seg[keep]
-        order = np.lexsort((seg, req))
+        order = np.lexsort((pos, seg, req))
         req, pos, loc, seg = req[order], pos[order], loc[order], seg[order]
         cut = np.nonzero((np.diff(req) != 0) | (np.diff(seg) != 0))[0] + 1
-        for a, b in zip(np.concatenate(([0], cut)), np.concatenate((cut, [len(req)]))):
-            r, g = int(req[a]), int(seg[a])
-            arrays[r][pos[a:b]] = self._segs[g][loc[a:b]]
-            haves[r][pos[a:b]] = True
+        bounds = zip(np.concatenate(([0], cut)), np.concatenate((cut, [len(req)])))
+
+        def copy(ab) -> None:
+            a, b = ab
+            r, g, p = int(req[a]), int(seg[a]), pos[a:b]
+            haves[r][p] = True
+            if p[-1] - p[0] == b - a - 1:  # contiguous positions: one copy
+                np.take(self._segs[g], loc[a:b], 0, arrays[r][p[0] : p[-1] + 1], "clip")
+            else:
+                arrays[r][p] = self._segs[g][loc[a:b]]
+
+        list(self._pool.map(copy, bounds))
         return arrays, haves
 
     def collect(self, outputs) -> tuple[list[Optional[np.ndarray]], dict[str, int]]:
