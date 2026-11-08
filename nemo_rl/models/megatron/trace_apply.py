@@ -20,10 +20,12 @@ layers (``NRL_TRACE_LAYERS``) the activation fake quantization follows the
 rollout: each element takes the E2M1 neighbour whose mantissa bit matches the
 rollout's code, under the rollout's own per-token and block scales.
 
-Transport: the rollout appends TRACE rows to the routed-experts tensor (see
-:mod:`nemo_rl.quantization.trace.layout`). :func:`attach_trace_rows` fetches
-them per microbatch and :func:`split_trace_rows` strips them before router
-replay consumes the routes, keeping the SP-local copy for the MoE layers.
+Transport: the rollout ships each sample's TRACE rows as a Ray ObjectRef (see
+:mod:`nemo_rl.quantization.trace.layout`). :func:`prefetch_trace_refs` starts
+fetching a rank's batch in the background, :func:`attach_trace_rows` appends
+the rows to each microbatch's routed-experts tensor and
+:func:`split_trace_rows` strips them before router replay consumes the routes,
+keeping the SP-local copy for the MoE layers.
 
 * fc1: ``MoELayer.preprocess`` (routing and shared experts already consumed
   the unquantized hidden states).

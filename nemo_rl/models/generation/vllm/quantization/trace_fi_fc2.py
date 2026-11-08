@@ -18,7 +18,7 @@ inside ``MoE::Runner::run`` (``trtllm_fused_moe_runner.cu``) into permuted rows
 that never reach Python. The overlay adds a small kernel after finalize that
 writes, for every expanded index ``e = token * top_k + k``, the packed mantissa
 bits and the scales of that row straight into the token's TRACE record in the
-routed-experts transit buffer (marker included), so no further encode ops run
+TRACE capture buffer (marker included), so no further encode ops run
 per layer.
 
 The record pointer is passed through a process-global set by the exported

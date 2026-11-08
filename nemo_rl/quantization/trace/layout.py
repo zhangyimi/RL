@@ -11,20 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Per-token TRACE payload layout carried on the router-replay side channel.
+"""Per-token TRACE payload layout.
 
-Rollout FP4 records travel back to the trainer as extra rows appended to the
-vLLM routed-experts capture buffer ``[tokens, num_layers + extra_rows, topk]``:
-each row holds ``topk`` bytes, so every per-token R3 code path (scheduler slot
-store, prefix-cache reuse, NeMo-RL padding, packing, CP/SP sharding) moves the
-payload bit-for-bit next to the routes. The trainer splits the extra rows off
-before router replay sees them.
+A token's payload is ``extra_rows`` rows of ``topk`` bytes. The rollout writes
+it into a TRACE-only buffer and returns it per request (see
+``trace_capture.SideStore``); the trainer appends the rows to the microbatch's
+routed-experts tensor ``[tokens, num_layers + extra_rows, topk]``, so NeMo-RL's
+padding, packing and CP/SP sharding move it next to the routes, and splits them
+off before router replay sees them.
 
 Only this module decides the byte layout; vLLM capture and the trainer both
 derive it from the model dimensions and ``NRL_TRACE_LAYERS`` (resolved from
-``nvfp4_pertoken_rollout.trace`` on the driver, see :mod:`.config`). It imports
-nothing heavier than torch because the vLLM scheduler process imports it to
-size its slot store.
+``nvfp4_pertoken_rollout.trace`` on the driver, see :mod:`.config`).
 
 Per guided MoE layer there are two records, each starting with a 4-byte marker:
 

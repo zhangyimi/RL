@@ -19,7 +19,7 @@ policy:
       # (same as the Nemotron 3.5 recipe).
       async_scheduling: false
       # Caps the KV block pool (peak use is ~10%) and with it the host-side
-      # routed-experts store, which carries the TRACE payload per cached token.
+      # routed-experts store.
       num_gpu_blocks_override: 16000
 checkpointing:
   save_period: 20
