@@ -164,22 +164,26 @@ def _install_side_store_hook() -> None:
 class SideStore:
     """Host store of TRACE rows keyed by (vLLM request id, token position).
 
-    Per engine step: one async D2H of the step's rows on a copy stream (the main
-    stream only waits on the copy before the next forward overwrites the
-    buffer); a background thread files the rows by request and position. The
-    engine thread never touches payload bytes. Positions served from the
-    prefix cache are filled at collection time from a request with the same
-    prompt that computed them.
+    Per engine step: one async D2H into a pinned ring on the engine stream.
+    Every ``BATCH_STEPS`` steps a background thread appends those steps' rows
+    to a host arena (one bulk copy per step) and records (request, start,
+    count) spans. Rows are filed by request and position in one vectorized
+    pass at ``collect``, so per-step host work is constant in the batch size.
+    Positions served from the prefix cache are filled at collection time from
+    a request whose prompt computed them.
     """
 
-    BLOCK = 256  # tokens per host block
+    SEG_BYTES = 1 << 30  # host arena segment
+    BATCH_STEPS = 32  # engine steps per store-thread wakeup
 
     def __init__(self, row_bytes: int) -> None:
         self.row_bytes = row_bytes
-        self._stream = torch.cuda.Stream()
         self._q: queue.Queue = queue.Queue()
-        self._blocks: dict[str, dict[int, np.ndarray]] = {}
-        self._spans: dict[str, list[tuple[int, int]]] = {}  # written positions
+        self._segs: list[np.ndarray] = []  # arena segments [rows, row_bytes]
+        self._seg_used = 0
+        # Per step: (segment, first row, request ids, starts, counts).
+        self._records: list[tuple[int, int, np.ndarray, np.ndarray, np.ndarray]] = []
+        self._rid_ix: dict[str, int] = {}
         # (prompt tokens, rows, have) of computed prompts since the last
         # prefix-cache reset: donors for later prefix-cache hits.
         self._prompt_rows: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
@@ -187,6 +191,7 @@ class SideStore:
         self.copied_bytes = 0
         cap_mb = int(os.environ.get("NRL_TRACE_SIDE_PINNED_MB", "512"))
         self._ring = _PinnedRing(cap_mb << 20)
+        self._pending: list = []
         threading.Thread(target=self._run, name="trace-side-store", daemon=True).start()
 
     def on_step(self, request_ids, token_starts, query_start_loc) -> None:
@@ -196,20 +201,30 @@ class SideStore:
         if n <= 0:
             return
         starts = np.array(token_starts[:n_req], dtype=np.int64)
-        # Snapshot on the main stream (a D2D copy, ~us) so the next forward
-        # can overwrite the capture buffer without waiting for the D2H copy.
-        src = _side_source(n).clone()
+        src = _side_source(n)
         nbytes = src.numel()
-        host, slot = self._ring.alloc(nbytes)
-        main = torch.cuda.current_stream()
-        with torch.cuda.stream(self._stream):
-            self._stream.wait_stream(main)
-            host.copy_(src.view(-1), non_blocking=True)
-            src.record_stream(self._stream)
-            done = torch.cuda.Event()
-            done.record(self._stream)
+        got = self._ring.alloc(nbytes, block=False)
+        if got is None:  # ring full: hand over what we hold, then wait
+            self._flush()
+            got = self._ring.alloc(nbytes)
+        host, slot = got
+        # D2H on the engine stream: one op per step, ordered before the next
+        # forward overwrites the buffer (1.5 MB/decode step over NVLink-C2C is
+        # a few us of GPU time; a side stream costs more host time than that).
+        host.copy_(src.reshape(-1), non_blocking=True)
         self.copied_bytes += nbytes
-        self._q.put((done, host, slot, list(request_ids), starts, qsl))
+        self._pending.append((host, slot, list(request_ids), starts, qsl))
+        # Wake the store thread once per batch of steps, not every step.
+        if len(self._pending) >= self.BATCH_STEPS:
+            self._flush()
+
+    def _flush(self) -> None:
+        if not self._pending:
+            return
+        done = torch.cuda.Event()
+        done.record()
+        self._q.put((done, self._pending))
+        self._pending = []
 
     def reset_prefix_cache(self) -> None:
         self._prompt_rows.clear()
@@ -218,60 +233,87 @@ class SideStore:
         while True:
             item = self._q.get()
             try:
-                done, host, slot, request_ids, starts, qsl = item
-                try:
-                    done.synchronize()
-                    rows = host.numpy().reshape(-1, self.row_bytes)
-                    for i, rid in enumerate(request_ids):
-                        self._write(rid, int(starts[i]), rows[qsl[i] : qsl[i + 1]])
-                finally:
-                    self._ring.release(slot)
+                done, steps = item
+                done.synchronize()
+                for host, slot, request_ids, starts, qsl in steps:
+                    try:
+                        self._append(host, request_ids, starts, qsl)
+                    finally:
+                        self._ring.release(slot)
             except BaseException as e:  # surfaced by collect()
                 self._err = e
             finally:
                 self._q.task_done()
 
-    def _write(self, rid: str, pos: int, rows: np.ndarray) -> None:
-        blocks = self._blocks.setdefault(rid, {})
-        b, off, k = self.BLOCK, 0, len(rows)
-        while off < k:
-            p = pos + off
-            blk = blocks.get(p // b)
-            if blk is None:
-                blk = blocks[p // b] = np.zeros((b, self.row_bytes), np.uint8)
-            lo = p % b
-            m = min(b - lo, k - off)
-            blk[lo : lo + m] = rows[off : off + m]
-            off += m
-        self._spans.setdefault(rid, []).append((pos, pos + k))
+    def _append(self, host: torch.Tensor, request_ids, starts, qsl) -> None:
+        n = int(qsl[-1])
+        seg_rows = max(self.SEG_BYTES // self.row_bytes, 1)
+        if not self._segs or self._seg_used + n > len(self._segs[-1]):
+            self._segs.append(np.empty((max(seg_rows, n), self.row_bytes), np.uint8))
+            self._seg_used = 0
+        r0 = self._seg_used
+        dst = torch.from_numpy(self._segs[-1][r0 : r0 + n])
+        dst.copy_(host.view(n, self.row_bytes))  # bulk copy, GIL released
+        self._seg_used += n
+        ix = self._rid_ix
+        ids = np.array([ix.setdefault(r, len(ix)) for r in request_ids], np.int64)
+        self._records.append((len(self._segs) - 1, r0, ids, starts, np.diff(qsl)))
+
+    def _file(self, outputs, lens: list[int]):
+        """Scatter arena rows into per-output arrays; later writes win."""
+        arrays = [np.zeros((max(L, 0), self.row_bytes), np.uint8) for L in lens]
+        haves = [np.zeros(max(L, 0), bool) for L in lens]
+        if not self._records:
+            return arrays, haves
+        ext = {o.request_id: i for i, o in enumerate(outputs)}
+        lut = np.full(len(self._rid_ix), -1, np.int64)
+        for rid, k in self._rid_ix.items():
+            lut[k] = ext.get(rid.rsplit("-", 1)[0], -1)
+        segs, r0s, ids, starts, counts = zip(*self._records)
+        nspan = np.array([len(c) for c in counts])
+        counts = np.concatenate(counts).astype(np.int64)
+        ids = np.concatenate(ids)
+        starts = np.concatenate(starts).astype(np.int64)
+        span_seg = np.repeat(np.array(segs, np.int64), nspan)
+        # First arena row of each span: record row + offset within the step.
+        span_first = np.cumsum(counts) - counts
+        rec_first = span_first[np.cumsum(nspan) - nspan]
+        within = span_first - np.repeat(rec_first, nspan)
+        span_row = np.repeat(np.array(r0s, np.int64), nspan) + within
+        tot = int(counts.sum())
+        off = np.arange(tot, dtype=np.int64) - np.repeat(span_first, counts)
+        req = np.repeat(lut[ids], counts)
+        pos = np.repeat(starts, counts) + off
+        loc = np.repeat(span_row, counts) + off
+        seg = np.repeat(span_seg, counts)
+        lens_a = np.array(lens, np.int64)
+        ok = req >= 0
+        ok[ok] &= pos[ok] < lens_a[req[ok]]
+        req, pos, loc, seg = req[ok], pos[ok], loc[ok], seg[ok]
+        # Keep the last write of each (request, position) (preemption recompute).
+        key = req * (int(lens_a.max(initial=0)) + 1) + pos
+        _, last = np.unique(key[::-1], return_index=True)
+        keep = len(key) - 1 - last
+        req, pos, loc, seg = req[keep], pos[keep], loc[keep], seg[keep]
+        order = np.lexsort((seg, req))
+        req, pos, loc, seg = req[order], pos[order], loc[order], seg[order]
+        cut = np.nonzero((np.diff(req) != 0) | (np.diff(seg) != 0))[0] + 1
+        for a, b in zip(np.concatenate(([0], cut)), np.concatenate((cut, [len(req)]))):
+            r, g = int(req[a]), int(seg[a])
+            arrays[r][pos[a:b]] = self._segs[g][loc[a:b]]
+            haves[r][pos[a:b]] = True
+        return arrays, haves
 
     def collect(self, outputs) -> tuple[list[Optional[np.ndarray]], dict[str, int]]:
         """Rows ``[prompt+response-1, extra_rows*topk]`` per vLLM RequestOutput."""
+        self._flush()
         self._q.join()
         if self._err is not None:
             err, self._err = self._err, None
             raise RuntimeError("TRACE side store failed") from err
-        by_ext: dict[str, list[str]] = {}
-        for rid in self._blocks:
-            by_ext.setdefault(rid.rsplit("-", 1)[0], []).append(rid)
-        b = self.BLOCK
-        arrays, haves, prompts = [], [], []
-        for out in outputs:
-            n = len(out.prompt_token_ids) + len(out.outputs[0].token_ids) - 1
-            arr = np.zeros((max(n, 0), self.row_bytes), np.uint8)
-            have = np.zeros(max(n, 0), bool)
-            for rid in by_ext.get(out.request_id, ()):
-                for bi, blk in self._blocks[rid].items():
-                    lo = bi * b
-                    if lo >= n:
-                        continue
-                    hi = min(lo + b, n)
-                    arr[lo:hi] = blk[: hi - lo]
-                for s0, s1 in self._spans.get(rid, ()):
-                    have[s0 : min(s1, n)] = True
-            arrays.append(arr)
-            haves.append(have)
-            prompts.append(len(out.prompt_token_ids))
+        lens = [len(o.prompt_token_ids) + len(o.outputs[0].token_ids) - 1 for o in outputs]
+        prompts = [len(o.prompt_token_ids) for o in outputs]
+        arrays, haves = self._file(outputs, lens)
         # Prefix-cache hits: position p of a prompt takes the rows of any
         # request (this call, or an earlier one since the last prefix-cache
         # reset) whose tokens agree on [0, p] -- same tokens, same weights =>
@@ -312,8 +354,10 @@ class SideStore:
                 seen.add(key)
                 self._prompt_rows.append((toks, arrays[i][:p].copy(), haves[i][:p].copy()))
         missing = int(sum((~h).sum() for h in haves))
-        self._blocks.clear()
-        self._spans.clear()
+        self._segs.clear()
+        self._seg_used = 0
+        self._records.clear()
+        self._rid_ix.clear()
         stats = {"prefix_filled": filled, "missing": missing}
         return arrays, stats
 
@@ -342,11 +386,13 @@ class _PinnedRing:
             return 0 if tail >= nbytes else None
         return head if tail - head >= nbytes else None
 
-    def alloc(self, nbytes: int) -> tuple[torch.Tensor, Any]:
+    def alloc(self, nbytes: int, block: bool = True) -> Optional[tuple[torch.Tensor, Any]]:
         if nbytes > self._cap // 2:
             return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True), None
         with self._cv:
             while (start := self._fit(nbytes)) is None:
+                if not block:
+                    return None
                 self._cv.wait()
             slot = (start, start + nbytes)
             self._live.append(slot)
