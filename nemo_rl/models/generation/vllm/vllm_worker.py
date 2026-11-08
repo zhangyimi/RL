@@ -17,11 +17,9 @@ import gc
 import inspect
 import logging
 import os
-import time
 import sys
 from typing import Any, Optional, cast
 
-import numpy as np
 import ray
 import torch
 from transformers import AutoConfig
@@ -687,17 +685,6 @@ class BaseVllmGenerationWorker:
         )
         if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
             validate_nvfp4_pertoken_model(hf_config)
-        from nemo_rl.quantization.trace.layout import (
-            layout_for_hf_config,
-            rides_on_r3,
-        )
-
-        if rides_on_r3():
-            import nemo_rl.models.generation.vllm.utils as vllm_utils
-
-            vllm_utils.G_TRACE_EXTRA_ROWS = layout_for_hf_config(
-                hf_config.get_text_config()
-            ).extra_rows
         if "GptOssForCausalLM" in getattr(hf_config, "architectures", []):
             if "quantization_config" in hf_config:
                 assert load_format == "dummy", (
@@ -1174,34 +1161,17 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         prompts = format_prompt_for_vllm_generation(data)
         prompts = [self._tokenize_prompt_with_bos(prompt) for prompt in prompts]
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
-        _prof = os.environ.get("NRL_TRACE_PROF") == "1"
-        _t_gen0 = time.perf_counter()
         outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
-        _t_gen1 = time.perf_counter()
-        _put_s = 0.0
-        _put_bytes = 0
 
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
         logprobs_list = []
         routed_experts_list = []
         trace_refs: list = []
-        from nemo_rl.models.generation.vllm import utils as _vllm_utils
         from nemo_rl.models.generation.vllm.quantization import trace_capture
-        from nemo_rl.quantization.trace import layout as trace_layout
 
-        trace_on_r3 = bool(_vllm_utils.G_TRACE_EXTRA_ROWS)
-        side = trace_capture._SIDE
-        trace_enabled = trace_on_r3 or side is not None
-        side_rows: list = []
-        side_stats: dict = {}
-        if side is not None:
-            _ts = time.perf_counter()
-            side_rows, side_stats = side.collect(outputs)
-            side_stats["collect_s"] = time.perf_counter() - _ts
-            lay = trace_capture._LAYOUT
-            side_rows = [a.reshape(a.shape[0], lay.extra_rows, lay.topk) for a in side_rows]
-        side_mismatch = 0
+        # TRACE rows [prompt+response-1, extra_rows, topk] per output.
+        trace_rows = trace_capture.collect_trace_rows(outputs)
         r3_missing_routes = []
         r3_expected_routes = []
         r3_actual_routes = []
@@ -1282,37 +1252,12 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 r3_actual_routes.append(r3_stats["actual_routes"])
             if full_routed_experts is not None:
                 routed_experts_list.append(full_routed_experts)
-            if trace_enabled:
+            if trace_rows is not None:
                 # TRACE payload stays in this node's object store; only the
                 # ref crosses the driver (see trace_apply.attach_trace_rows).
-                trace_np = r3_stats.pop("trace", None) if r3_stats else None
-                if side is not None:
-                    if trace_np is not None:  # transport=both: must agree bit for bit
-                        ref_np, got = trace_np, side_rows[i]
-                        if ref_np.shape != got.shape or not np.array_equal(ref_np, got):
-                            side_mismatch += 1
-                            if side_mismatch <= 4:
-                                n = min(len(ref_np), len(got))
-                                bad = np.nonzero((ref_np[:n] != got[:n]).any(axis=(1, 2)))[0]
-                                print(
-                                    f"[trace] side/r3 mismatch sample {i}: shapes "
-                                    f"{ref_np.shape} vs {got.shape}, bad positions "
-                                    f"{bad[:8].tolist()} of {len(bad)} "
-                                    f"(prompt {len(output.prompt_token_ids)})",
-                                    flush=True,
-                                )
-                    trace_np = side_rows[i] if len(side_rows[i]) else None
-                    side_rows[i] = None
-                _tp = time.perf_counter()
-                trace_refs.append(ray.put(trace_np) if trace_np is not None else None)
-                _put_s += time.perf_counter() - _tp
-                _put_bytes += trace_np.nbytes if trace_np is not None else 0
-                # vLLM's capture arrays carry the full TRACE rows; drop them
-                # now rather than holding every request's copy until the
-                # batch is assembled.
+                trace_np, trace_rows[i] = trace_rows[i], None
+                trace_refs.append(ray.put(trace_np) if len(trace_np) else None)
                 del trace_np
-                generation.routed_experts = None
-                output.prompt_routed_experts = None
 
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
@@ -1325,22 +1270,6 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 f"response_length={response_length} > max_model_len={self.llm.llm_engine.model_config.max_model_len}, which should not happen. Please check this behavior in isolation by running `uv run --extra vllm tools/model_diagnostics/1.max_model_len_respected.py {self.llm.llm_engine.model_config.model}` and raise this issue with the vllm team."
             )
 
-        if _prof:
-            _ntok = sum(unpadded_sequence_lengths)
-            print(
-                f"[trace-prof] vllm_generate n={len(outputs)} tokens={_ntok} "
-                f"gen_tokens={sum(generation_lengths)} max_gen={max(generation_lengths, default=0)} "
-                f"llm_generate_s={_t_gen1 - _t_gen0:.2f} post_s={time.perf_counter() - _t_gen1:.2f} "
-                f"put_s={_put_s:.2f} put_GB={_put_bytes / 1e9:.3f} "
-                f"transport={trace_layout.transport() if trace_enabled else 'off'} "
-                f"side={side_stats} side_r3_mismatch={side_mismatch}",
-                flush=True,
-            )
-        if side is not None and trace_layout.transport() == "both":
-            print(
-                f"[trace] side-vs-r3 check: {side_mismatch}/{len(outputs)} samples differ",
-                flush=True,
-            )
         # Create return data conforming to GenerationOutputSpec
         output_ids = torch.stack(output_ids_list)
         logprobs = torch.stack(logprobs_list)
@@ -1377,7 +1306,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         )
         if routed_experts_list:
             return_data["routed_experts"] = torch.stack(routed_experts_list)
-        if trace_enabled:
+        if trace_rows is not None:
             return_data["trace_ref"] = trace_refs
         if r3_missing_routes:
             return_data["r3_routed_experts_missing_routes"] = torch.tensor(

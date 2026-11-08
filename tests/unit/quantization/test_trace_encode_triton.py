@@ -30,11 +30,17 @@ def test_fused_fc1_matches_torch(hidden, topk, n):
     rec = L.SiteRecord(layer=0, row_offset=3, rows=rows)
     layout = type("Lay", (), {"topk": topk})()
     # Producer tensors padded past H like the quantize kernel's outputs.
-    codes = torch.randint(0, 256, (n, hidden // 2 + 64), dtype=torch.uint8, device="cuda", generator=g)
-    sf = torch.randint(0, 256, (n, hidden // 16 + 8), dtype=torch.uint8, device="cuda", generator=g)
+    codes = torch.randint(
+        0, 256, (n, hidden // 2 + 64), dtype=torch.uint8, device="cuda", generator=g
+    )
+    sf = torch.randint(
+        0, 256, (n, hidden // 16 + 8), dtype=torch.uint8, device="cuda", generator=g
+    )
     tok = torch.rand(n, device="cuda", generator=g) * 7 + 1e-3
 
-    want = L.encode_fc1(layout, rec, codes[:, : hidden // 2], sf[:, : hidden // 16], tok)
+    want = L.encode_fc1(
+        layout, rec, codes[:, : hidden // 2], sf[:, : hidden // 16], tok
+    )
 
     total_rows = rec.row_offset + rows + 5
     buf = torch.full((n + 3, total_rows, topk), 0x3C, dtype=torch.uint8, device="cuda")
