@@ -14,7 +14,8 @@ TRACE ([arXiv 2610.07767](https://arxiv.org/abs/2610.07767)) reduces the mismatc
 - Per-token NVFP4 rollout (`generation.nvfp4_pertoken_rollout.enabled: true`) with Megatron training.
 - A TE precision recipe that keeps the routed experts in BF16 (`examples/te_precision/all_bf16_trace_qat.yaml`); the trainer checks this.
 - Router replay (`policy.router_replay.enabled: true`).
-- vLLM tensor parallel size 1, synchronous vLLM engine (`vllm_cfg.async_engine: false`), GRPO.
+- vLLM tensor parallel size 1, GRPO.
+- With the async vLLM engine (`vllm_cfg.async_engine: true`) and async GRPO, set `grpo.async_grpo.recompute_kv_cache_after_weight_updates: true`.
 - On the first run, FlashInfer JIT-compiles a patched TRT-LLM MoE module that exposes the `fc2` codes and scales, which takes about 15 minutes. Point `FLASHINFER_WORKSPACE_BASE` (in `vllm_cfg.env_vars`) at a shared directory to reuse the build.
 
 ## Configuration
@@ -73,4 +74,4 @@ Plain NVFP4 training drifts from the rollout as training goes on and collapses; 
 
 - One bit cannot fix every element: when the training value is too far from the rollout value, neither neighbor matches. These cases grow with depth.
 - The rollout-side hooks patch vLLM and FlashInfer sources at fixed anchors. They are validated on the pinned vLLM nightly and FlashInfer 0.7, and fail loudly on a version they do not match.
-- The async vLLM engine and SingleController are not supported yet.
+- SingleController and HTTP rollouts (`vllm_cfg.expose_http_server`, NeMo-Gym) are not supported yet.

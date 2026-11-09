@@ -16,7 +16,9 @@
 Writes each selected layer's rollout FP4 record (see
 :mod:`nemo_rl.quantization.trace.layout`) into a TRACE-only device buffer
 ``[max_tokens, extra_rows, topk]`` and hands every engine step's rows to a
-host :class:`SideStore`, which returns them per request after ``generate``.
+host :class:`SideStore`, which returns them per request after ``generate``
+(sync engine) or per batch of finished requests (async engine,
+:func:`trace_sync_on_worker`).
 
 Hooks (installed by :func:`apply_trace_capture_patches` / :func:`register_capturer`):
 
@@ -193,14 +195,48 @@ def collect_trace_refs_on_worker(worker, items) -> Optional[list]:
     Returns one Ray ref (or None for an empty row set) per item on rank 0,
     None on the other ranks.
     """
-    import types
-
     import ray
 
     del worker
     if _SIDE is None or (_TP_MERGE is not None and not _TP_MERGE.is_first_rank):
         return None
-    outs = [
+    rows = collect_trace_rows(_as_outputs(items))
+    return [ray.put(a) if len(a) else None for a in rows]
+
+
+def trace_sync_on_worker(collect_items, register_items, release_ids) -> Optional[list]:
+    """Async-engine counterpart of :func:`collect_trace_refs_on_worker`.
+
+    Runs in the process that owns the side store (the AsyncLLM engine core
+    with TP=1, the Ray GPU workers with TP>1), reached by name through the
+    worker extension's ``trace_sync``. One call per batch of requests that
+    finished since the last call; it also registers the prompts of newly
+    submitted requests (live prefix donors) and drops aborted requests.
+    ``collect_items``: ``(request_id, prompt_token_ids, token_ids)``.
+
+    Returns, on the output rank, one ``[n, extra_rows, topk]`` uint8 array (or
+    None when empty) per collect item; the AsyncLLM process ``ray.put``s them.
+    None on the other ranks or when capture is off.
+    """
+    if _SIDE is None or (_TP_MERGE is not None and not _TP_MERGE.is_first_rank):
+        return None
+    if register_items:
+        _SIDE.register_prompts(register_items)
+    rows: list = []
+    if collect_items:
+        outs = _as_outputs(collect_items)
+        arrays, _ = _SIDE.collect(outs, release_all=False)
+        e, k = _LAYOUT.extra_rows, _LAYOUT.topk
+        rows = [a.reshape(a.shape[0], e, k) if len(a) else None for a in arrays]
+    if release_ids:
+        _SIDE.release(release_ids)
+    return rows
+
+
+def _as_outputs(items) -> list:
+    import types
+
+    return [
         types.SimpleNamespace(
             request_id=r,
             prompt_token_ids=p,
@@ -208,8 +244,6 @@ def collect_trace_refs_on_worker(worker, items) -> Optional[list]:
         )
         for r, p, t in items
     ]
-    rows = collect_trace_rows(outs)
-    return [ray.put(a) if len(a) else None for a in rows]
 
 
 def _install_side_store_hook() -> None:
@@ -261,6 +295,53 @@ def _install_side_store_hook() -> None:
     cls._nrl_trace_side = True
 
 
+class _Spans:
+    """Growable span table in step order: one row per (engine step, request).
+
+    Columns: request index, first position, row count, arena segment, first
+    arena row, prefix-cache generation of the step.
+    """
+
+    COLS = ("ix", "start", "count", "seg", "row", "gen")
+
+    def __init__(self) -> None:
+        self.n = 0
+        self._c = {k: np.empty(1024, np.int64) for k in self.COLS}
+
+    def col(self, k: str) -> np.ndarray:
+        return self._c[k][: self.n]
+
+    def extend(self, **cols) -> None:
+        m = len(cols["ix"])
+        cap = len(self._c["ix"])
+        if self.n + m > cap:
+            cap = max(2 * cap, self.n + m)
+            for k in self.COLS:
+                grown = np.empty(cap, np.int64)
+                grown[: self.n] = self._c[k][: self.n]
+                self._c[k] = grown
+        for k in self.COLS:
+            self._c[k][self.n : self.n + m] = cols[k]
+        self.n += m
+
+    def keep(self, mask: np.ndarray) -> None:
+        m = int(mask.sum())
+        for k in self.COLS:
+            self._c[k][:m] = self._c[k][: self.n][mask]
+        self.n = m
+
+
+# Prompts are indexed for live prefix donors by their first tokens; a prefix
+# cache hit covers at least one KV block, which is never shorter than this.
+_DONOR_KEY_TOKENS = 16
+
+
+def _lcp(a: np.ndarray, b: np.ndarray) -> int:
+    m = min(len(a), len(b))
+    neq = np.nonzero(a[:m] != b[:m])[0]
+    return int(neq[0]) if len(neq) else m
+
+
 class SideStore:
     """Host store of TRACE rows keyed by (vLLM request id, token position).
 
@@ -271,24 +352,54 @@ class SideStore:
     pass at ``collect``, so per-step host work is constant in the batch size.
     Positions served from the prefix cache are filled at collection time from
     a request whose prompt computed them.
+
+    ``collect(outputs)`` (sync engine) files a whole finished batch and clears
+    the arena. ``collect(outputs, release_all=False)`` (async engine) files
+    and releases only those requests while others are still running; the
+    arena is compacted once released rows outweigh live ones. Requests still
+    running can then donate prefix-cache rows if their prompts were passed to
+    ``register_prompts``.
+
+    Every step is tagged with the prefix-cache generation (bumped by
+    ``reset_prefix_cache``). A reset preempts running requests, so a request's
+    rows from before its latest generation are superseded, and donors must be
+    from the same generation (same weights, same cache).
     """
 
     SEG_BYTES = 1 << 30  # host arena segment
     BATCH_STEPS = 32  # engine steps per store-thread wakeup
     PINNED_BYTES = 512 << 20  # D2H staging ring
     FILE_THREADS = 8  # collect-time row copies (numpy releases the GIL)
+    COMPACT_BYTES = 1 << 30  # released rows before the arena is compacted
+    RETIRED_IDS = 1 << 16  # recently released internal ids remembered
 
     def __init__(self, row_bytes: int) -> None:
         self.row_bytes = row_bytes
         self._q: queue.Queue = queue.Queue()
+        # Serializes the engine thread (on_step) with collection calls, which
+        # may come from another thread (Ray actor RPCs with TP>1).
+        self._lock = threading.RLock()
         self._segs: list[np.ndarray] = []  # arena segments [rows, row_bytes]
         self._seg_used = 0
-        # Per step: (segment, first row, request ids, starts, counts).
-        self._records: list[tuple[int, int, np.ndarray, np.ndarray, np.ndarray]] = []
-        self._rid_ix: dict[str, int] = {}
-        # (prompt tokens, rows, have) of computed prompts since the last
-        # prefix-cache reset: donors for later prefix-cache hits.
-        self._prompt_rows: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        self._spans = _Spans()
+        self._rid_ix: dict[str, int] = {}  # vLLM internal request id -> index
+        self._ix_rid: dict[int, str] = {}
+        self._ext_ix: dict[str, list[int]] = {}  # RequestOutput id -> indices
+        self._next_ix = 0
+        self._retired: collections.OrderedDict[str, None] = collections.OrderedDict()
+        self._rows = 0  # arena rows, live + released
+        self._dead_rows = 0
+        self._gen = 0
+        # Per generation, per distinct prompt: (prompt tokens, rows, have) of
+        # computed prompts of collected requests -- donors for later
+        # prefix-cache hits.
+        self._prompt_rows: dict[
+            int, dict[bytes, tuple[np.ndarray, np.ndarray, np.ndarray]]
+        ] = {}
+        # Prompts of running requests (async engine), indexed by first tokens.
+        self._live_prompts: dict[str, np.ndarray] = {}
+        self._live_index: dict[bytes, set[str]] = {}
+        self._live_exact: dict[bytes, set[str]] = {}
         self._err: Optional[BaseException] = None
         self._ring = _PinnedRing(self.PINNED_BYTES)
         self._pending: list = []
@@ -306,40 +417,53 @@ class SideStore:
         starts = np.array(token_starts[:n_req], dtype=np.int64)
         src = _TRACE_BUF[:n]
         nbytes = src.numel()
-        got = self._ring.alloc(nbytes, block=False)
-        if got is None:  # ring full: hand over what we hold, then wait
-            self._flush()
-            got = self._ring.alloc(nbytes)
-        host, slot = got
-        # D2H on the engine stream: one op per step, ordered before the next
-        # forward overwrites the buffer (1.5 MB/decode step over NVLink-C2C is
-        # a few us of GPU time; a side stream costs more host time than that).
-        host.copy_(src.reshape(-1), non_blocking=True)
-        self._pending.append((host, slot, list(request_ids), starts, qsl))
-        # Wake the store thread once per batch of steps, not every step.
-        if len(self._pending) >= self.BATCH_STEPS:
-            self._flush()
+        with self._lock:
+            got = self._ring.alloc(nbytes, block=False)
+            if got is None:  # ring full: hand over what we hold, then wait
+                self._flush()
+                got = self._ring.alloc(nbytes)
+            host, slot = got
+            # D2H on the engine stream: one op per step, ordered before the
+            # next forward overwrites the buffer (1.5 MB/decode step over
+            # NVLink-C2C is a few us of GPU time; a side stream costs more host
+            # time than that).
+            host.copy_(src.reshape(-1), non_blocking=True)
+            # Recorded here (engine thread, engine stream) so a flush from a
+            # collecting thread waits on the right stream.
+            done = None
+            if src.is_cuda:
+                done = torch.cuda.Event()
+                done.record()
+            self._pending.append(
+                (host, slot, list(request_ids), starts, qsl, self._gen, done)
+            )
+            # Wake the store thread once per batch of steps, not every step.
+            if len(self._pending) >= self.BATCH_STEPS:
+                self._flush()
 
     def _flush(self) -> None:
         if not self._pending:
             return
-        done = torch.cuda.Event()
-        done.record()
-        self._q.put((done, self._pending))
+        self._q.put(self._pending)
         self._pending = []
 
     def reset_prefix_cache(self) -> None:
-        self._prompt_rows.clear()
+        with self._lock:
+            self._gen += 1
+            if not self._pending and not self._q.unfinished_tasks and not self._ext_ix:
+                # Nothing in flight can still need older donors.
+                self._prompt_rows.clear()
 
     def _run(self) -> None:
         while True:
-            item = self._q.get()
+            steps = self._q.get()
             try:
-                done, steps = item
-                done.synchronize()
-                for host, slot, request_ids, starts, qsl in steps:
+                done = steps[-1][-1]
+                if done is not None:
+                    done.synchronize()
+                for host, slot, request_ids, starts, qsl, gen, _ in steps:
                     try:
-                        self._append(host, request_ids, starts, qsl)
+                        self._append(host, request_ids, starts, qsl, gen)
                     finally:
                         self._ring.release(slot)
             except BaseException as e:  # surfaced by collect()
@@ -347,7 +471,16 @@ class SideStore:
             finally:
                 self._q.task_done()
 
-    def _append(self, host: torch.Tensor, request_ids, starts, qsl) -> None:
+    def _ix_for(self, rid: str) -> int:
+        k = self._rid_ix.get(rid)
+        if k is None:
+            k = self._rid_ix[rid] = self._next_ix
+            self._ix_rid[k] = rid
+            self._next_ix += 1
+            self._ext_ix.setdefault(rid.rsplit("-", 1)[0], []).append(k)
+        return k
+
+    def _append(self, host: torch.Tensor, request_ids, starts, qsl, gen: int) -> None:
         n = int(qsl[-1])
         seg_rows = max(self.SEG_BYTES // self.row_bytes, 1)
         if not self._segs or self._seg_used + n > len(self._segs[-1]):
@@ -357,40 +490,64 @@ class SideStore:
         dst = torch.from_numpy(self._segs[-1][r0 : r0 + n])
         dst.copy_(host.view(n, self.row_bytes))  # bulk copy, GIL released
         self._seg_used += n
-        ix = self._rid_ix
-        ids = np.array([ix.setdefault(r, len(ix)) for r in request_ids], np.int64)
-        self._records.append((len(self._segs) - 1, r0, ids, starts, np.diff(qsl)))
+        self._rows += n
+        counts = np.diff(qsl)
+        rows = r0 + qsl[:-1]
+        if self._retired:
+            # A step that still covers a released request (late output): its
+            # rows are dead on arrival.
+            late = np.array([r in self._retired for r in request_ids], bool)
+            if late.any():
+                self._dead_rows += int(counts[late].sum())
+                request_ids = [r for r, x in zip(request_ids, late) if not x]
+                starts, counts, rows = starts[~late], counts[~late], rows[~late]
+        ids = np.array([self._ix_for(r) for r in request_ids], np.int64)
+        self._spans.extend(
+            ix=ids,
+            start=starts,
+            count=counts,
+            seg=len(self._segs) - 1,
+            row=rows,
+            gen=gen,
+        )
 
     def _file(self, outputs, lens: list[int]):
-        """Scatter arena rows into per-output arrays; later writes win."""
+        """Scatter arena rows into per-output arrays; later writes win.
+
+        Only rows from each request's latest generation are used. Returns the
+        arrays, their have-masks, each request's latest generation (-1 if it
+        has no rows) and the number of arena rows the requests hold.
+        """
         arrays = [np.zeros((max(L, 0), self.row_bytes), np.uint8) for L in lens]
         haves = [np.zeros(max(L, 0), bool) for L in lens]
-        if not self._records:
-            return arrays, haves
-        ext = {o.request_id: i for i, o in enumerate(outputs)}
-        lut = np.full(len(self._rid_ix), -1, np.int64)
-        for rid, k in self._rid_ix.items():
-            lut[k] = ext.get(rid.rsplit("-", 1)[0], -1)
-        segs, r0s, ids, starts, counts = zip(*self._records)
-        nspan = np.array([len(c) for c in counts])
-        counts = np.concatenate(counts).astype(np.int64)
-        ids = np.concatenate(ids)
-        starts = np.concatenate(starts).astype(np.int64)
-        span_seg = np.repeat(np.array(segs, np.int64), nspan)
-        # First arena row of each span: record row + offset within the step.
-        span_first = np.cumsum(counts) - counts
-        rec_first = span_first[np.cumsum(nspan) - nspan]
-        within = span_first - np.repeat(rec_first, nspan)
-        span_row = np.repeat(np.array(r0s, np.int64), nspan) + within
+        req_gen = np.full(len(outputs), -1, np.int64)
+        t = self._spans
+        if not t.n:
+            return arrays, haves, req_gen, 0
+        lut = np.full(self._next_ix, -1, np.int64)
+        for i, o in enumerate(outputs):
+            lut[self._ext_ix.get(o.request_id, [])] = i
+        req = lut[t.col("ix")]
+        sel = np.nonzero(req >= 0)[0]
+        if not len(sel):
+            return arrays, haves, req_gen, 0
+        req = req[sel]
+        starts, counts = t.col("start")[sel], t.col("count")[sel]
+        segs, rows, gens = t.col("seg")[sel], t.col("row")[sel], t.col("gen")[sel]
+        held = int(counts.sum())
+        np.maximum.at(req_gen, req, gens)
+        cur = gens == req_gen[req]
+        req, starts, counts = req[cur], starts[cur], counts[cur]
+        segs, rows = segs[cur], rows[cur]
         tot = int(counts.sum())
-        off = np.arange(tot, dtype=np.int64) - np.repeat(span_first, counts)
-        req = np.repeat(lut[ids], counts)
+        first = np.cumsum(counts) - counts
+        off = np.arange(tot, dtype=np.int64) - np.repeat(first, counts)
+        req = np.repeat(req, counts)
         pos = np.repeat(starts, counts) + off
-        loc = np.repeat(span_row, counts) + off
-        seg = np.repeat(span_seg, counts)
+        loc = np.repeat(rows, counts) + off
+        seg = np.repeat(segs, counts)
         lens_a = np.array(lens, np.int64)
-        ok = req >= 0
-        ok[ok] &= pos[ok] < lens_a[req[ok]]
+        ok = pos < lens_a[req]
         req, pos, loc, seg = req[ok], pos[ok], loc[ok], seg[ok]
         # Keep the last write of each (request, position) (preemption recompute).
         key = req * (int(lens_a.max(initial=0)) + 1) + pos
@@ -412,41 +569,217 @@ class SideStore:
                 arrays[r][p] = self._segs[g][loc[a:b]]
 
         list(self._pool.map(copy, bounds))
-        return arrays, haves
+        return arrays, haves, req_gen, held
 
-    def collect(self, outputs) -> tuple[list[Optional[np.ndarray]], dict[str, int]]:
-        """Rows ``[prompt+response-1, extra_rows*topk]`` per vLLM RequestOutput."""
+    def _fill_from_live(
+        self, toks: np.ndarray, rows: np.ndarray, have: np.ndarray, gen: int, skip
+    ) -> int:
+        """Fill missing prompt positions from running requests' arena rows.
+
+        Requests with the same prompt (GRPO group) first; then any running
+        request sharing a prefix (e.g. the chat template).
+        """
+        filled = 0
+        exact = self._live_exact.get(toks.tobytes(), set())
+        for tier in (exact, None):
+            miss = ~have
+            if not miss.any():
+                break
+            hi = int(np.nonzero(miss)[0][-1]) + 1
+            lcp_by_ix = np.zeros(self._next_ix, np.int64)
+            if tier is not None:
+                for ext in tier - skip:
+                    lcp_by_ix[self._ext_ix.get(ext, [])] = hi
+            else:
+                key = toks[:_DONOR_KEY_TOKENS].tobytes()
+                for ext in self._live_index.get(key, set()) - skip - exact:
+                    lcp = min(_lcp(toks[:hi], self._live_prompts[ext]), hi)
+                    lcp_by_ix[self._ext_ix.get(ext, [])] = lcp
+            if lcp_by_ix.any():
+                filled += self._fill_from_spans(lcp_by_ix, rows, have, gen)
+        return filled
+
+    def _fill_from_spans(
+        self, lcp_by_ix: np.ndarray, rows: np.ndarray, have: np.ndarray, gen: int
+    ) -> int:
+        """Copy rows at missing positions < lcp of each donor index."""
+        miss = ~have
+        t = self._spans
+        lc = lcp_by_ix[t.col("ix")]
+        starts = t.col("start")
+        sel = np.nonzero((lc > 0) & (t.col("gen") == gen) & (starts < lc))[0]
+        if not len(sel):
+            return 0
+        starts, lc = starts[sel], lc[sel]
+        counts = np.minimum(t.col("count")[sel], lc - starts)
+        first = np.cumsum(counts) - counts
+        off = np.arange(int(counts.sum()), dtype=np.int64) - np.repeat(first, counts)
+        pos = np.repeat(starts, counts) + off
+        loc = np.repeat(t.col("row")[sel], counts) + off
+        seg = np.repeat(t.col("seg")[sel], counts)
+        ok = miss[pos]
+        pos, loc, seg = pos[ok], loc[ok], seg[ok]
+        pos, idx = np.unique(pos, return_index=True)  # one source per position
+        loc, seg = loc[idx], seg[idx]
+        for g in np.unique(seg):
+            m = seg == g
+            rows[pos[m]] = self._segs[int(g)][loc[m]]
+        have[pos] = True
+        return len(pos)
+
+    def register_prompts(self, items) -> None:
+        """Prompts ``(request_id, prompt_token_ids)`` of submitted requests.
+
+        Lets a request that finishes first take prefix-cache rows from a
+        running one (async engine). Removed when the request is released.
+        """
+        with self._lock:
+            for rid, toks in items:
+                toks = np.asarray(toks, np.int64)
+                self._live_prompts[rid] = toks
+                key = toks[:_DONOR_KEY_TOKENS].tobytes()
+                self._live_index.setdefault(key, set()).add(rid)
+                self._live_exact.setdefault(toks.tobytes(), set()).add(rid)
+
+    def release(self, request_ids) -> None:
+        """Drop the rows of requests that will not be collected (aborted)."""
+        with self._lock:
+            self._sync()
+            ixs = [k for r in request_ids for k in self._ext_ix.get(r, [])]
+            if ixs:
+                ix = self._spans.col("ix")
+                self._dead_rows += int(self._spans.col("count")[np.isin(ix, ixs)].sum())
+            self._retire(request_ids)
+            self._maybe_compact()
+
+    def _retire(self, request_ids) -> None:
+        for ext in request_ids:
+            toks = self._live_prompts.pop(ext, None)
+            if toks is not None:
+                for index, key in (
+                    (self._live_index, toks[:_DONOR_KEY_TOKENS].tobytes()),
+                    (self._live_exact, toks.tobytes()),
+                ):
+                    live = index.get(key)
+                    if live is not None:
+                        live.discard(ext)
+                        if not live:
+                            del index[key]
+            for k in self._ext_ix.pop(ext, []):
+                rid = self._ix_rid.pop(k)
+                del self._rid_ix[rid]
+                self._retired[rid] = None
+        while len(self._retired) > self.RETIRED_IDS:
+            self._retired.popitem(last=False)
+
+    def _clear(self, prompts: bool) -> None:
+        self._segs.clear()
+        self._seg_used = 0
+        self._spans.n = 0
+        self._rid_ix.clear()
+        self._ix_rid.clear()
+        self._ext_ix.clear()
+        self._next_ix = 0
+        self._rows = self._dead_rows = 0
+        if prompts:
+            self._live_prompts.clear()
+            self._live_index.clear()
+            self._live_exact.clear()
+
+    def _maybe_compact(self) -> None:
+        if not self._ext_ix:
+            self._clear(prompts=False)  # everything released: drop the arena
+            return
+        live_rows = self._rows - self._dead_rows
+        min_dead = max(self.COMPACT_BYTES // self.row_bytes, 1)
+        if self._dead_rows >= max(live_rows, min_dead):
+            self._compact()
+
+    def _compact(self) -> None:
+        """Copy the live rows into fresh segments and renumber the requests."""
+        t = self._spans
+        live_ix = np.fromiter(self._ix_rid, np.int64, len(self._ix_rid))
+        remap = np.full(self._next_ix, -1, np.int64)
+        remap[live_ix] = np.arange(len(live_ix))
+        t.keep(remap[t.col("ix")] >= 0)
+        t.col("ix")[:] = remap[t.col("ix")]
+        segs, rows, counts = t.col("seg"), t.col("row"), t.col("count")
+        new_segs, new_rows = np.empty_like(segs), np.empty_like(rows)
+        old, self._segs = self._segs, []
+        for g in np.unique(segs):
+            m = segs == g
+            c = counts[m]
+            first = np.cumsum(c) - c
+            n = int(c.sum())
+            src = np.repeat(rows[m], c) + (np.arange(n) - np.repeat(first, c))
+            self._segs.append(np.take(old[int(g)], src, axis=0))
+            new_segs[m] = len(self._segs) - 1
+            new_rows[m] = first
+        segs[:] = new_segs
+        rows[:] = new_rows
+        del old
+        # Later steps start a fresh segment.
+        self._seg_used = len(self._segs[-1]) if self._segs else 0
+        self._rows = int(counts.sum())
+        self._dead_rows = 0
+        self._rid_ix = {rid: int(remap[k]) for rid, k in self._rid_ix.items()}
+        self._ix_rid = {k: rid for rid, k in self._rid_ix.items()}
+        self._ext_ix = {
+            ext: [int(remap[k]) for k in ks] for ext, ks in self._ext_ix.items()
+        }
+        self._next_ix = len(live_ix)
+
+    def _sync(self) -> None:
+        """Wait until every captured step is in the arena."""
         self._flush()
         self._q.join()
         if self._err is not None:
             err, self._err = self._err, None
             raise RuntimeError("TRACE side store failed") from err
+
+    def collect(
+        self, outputs, release_all: bool = True
+    ) -> tuple[list[Optional[np.ndarray]], dict[str, int]]:
+        """Rows ``[prompt+response-1, extra_rows*topk]`` per vLLM RequestOutput.
+
+        ``release_all`` drops the whole arena afterwards (every request of the
+        engine is in ``outputs``); otherwise only these requests are released.
+        """
+        with self._lock:
+            return self._collect(outputs, release_all)
+
+    def _collect(self, outputs, release_all: bool):
+        self._sync()
         lens = [
             len(o.prompt_token_ids) + len(o.outputs[0].token_ids) - 1 for o in outputs
         ]
         prompts = [len(o.prompt_token_ids) for o in outputs]
-        arrays, haves = self._file(outputs, lens)
+        arrays, haves, req_gen, held = self._file(outputs, lens)
+        req_gen[req_gen < 0] = self._gen
+        toks_all = [np.asarray(o.prompt_token_ids, np.int64) for o in outputs]
         # Prefix-cache hits: position p of a prompt takes the rows of any
-        # request (this call, or an earlier one since the last prefix-cache
-        # reset) whose tokens agree on [0, p] -- same tokens, same weights =>
-        # same codes. Shared chat-template prefixes are reused across prompts.
-        donors = list(self._prompt_rows)
-        for i, out in enumerate(outputs):
+        # request (this call, an earlier one, or a running one) of the same
+        # generation whose tokens agree on [0, p] -- same tokens, same
+        # weights => same codes. Shared chat-template prefixes are reused
+        # across prompts.
+        this_call: dict[int, list] = {}
+        for i in range(len(outputs)):
             p = min(prompts[i], len(haves[i]))
-            donors.append(
-                (np.asarray(out.prompt_token_ids[:p]), arrays[i][:p], haves[i][:p])
+            this_call.setdefault(int(req_gen[i]), []).append(
+                (toks_all[i][:p], arrays[i][:p], haves[i][:p])
             )
+        skip = {o.request_id for o in outputs}
         filled = 0
-        for i, out in enumerate(outputs):
+        for i in range(len(outputs)):
             p = min(prompts[i], len(haves[i]))
             miss = ~haves[i][:p]
             if not miss.any():
                 continue
-            toks = np.asarray(out.prompt_token_ids[:p])
+            g = int(req_gen[i])
+            toks = toks_all[i][:p]
+            donors = list(self._prompt_rows.get(g, {}).values()) + this_call[g]
             for d_toks, d_rows, d_have in donors:
-                m = min(p, len(d_toks))
-                neq = np.nonzero(toks[:m] != d_toks[:m])[0]
-                lcp = int(neq[0]) if len(neq) else m
+                lcp = _lcp(toks, d_toks)
                 if lcp == 0:
                     continue
                 take = miss[:lcp] & d_have[:lcp]
@@ -458,22 +791,31 @@ class SideStore:
                     miss[:lcp] &= ~take
                 if not miss.any():
                     break
-        # Keep each distinct computed prompt for later calls (until reset).
-        seen = {d[0].tobytes() for d in self._prompt_rows}
-        for i, out in enumerate(outputs):
-            p = min(prompts[i], len(haves[i]))
-            toks = np.asarray(out.prompt_token_ids[:p])
-            key = toks.tobytes()
-            if p and key not in seen and haves[i][:p].all():
-                seen.add(key)
-                self._prompt_rows.append(
-                    (toks, arrays[i][:p].copy(), haves[i][:p].copy())
+            if miss.any() and self._live_prompts:
+                filled += self._fill_from_live(
+                    toks, arrays[i][:p], haves[i][:p], g, skip
                 )
+        # Keep each distinct computed prompt for later calls (until reset).
+        for i in range(len(outputs)):
+            p = min(prompts[i], len(haves[i]))
+            pool = self._prompt_rows.setdefault(int(req_gen[i]), {})
+            key = toks_all[i][:p].tobytes()
+            if p and key not in pool and haves[i][:p].all():
+                pool[key] = (toks_all[i][:p], arrays[i][:p].copy(), haves[i][:p].copy())
         missing = int(sum((~h).sum() for h in haves))
-        self._segs.clear()
-        self._seg_used = 0
-        self._records.clear()
-        self._rid_ix.clear()
+        if release_all:
+            self._clear(prompts=True)
+        else:
+            self._dead_rows += held
+            self._retire(list(skip))
+            self._maybe_compact()
+        # Donor pools stay while a running request may still be in their
+        # generation (it was admitted before the reset and not preempted yet).
+        oldest = self._gen
+        if self._spans.n:
+            oldest = min(oldest, int(self._spans.col("gen").min()))
+        for g in [g for g in self._prompt_rows if g < oldest]:
+            del self._prompt_rows[g]
         stats = {"prefix_filled": filled, "missing": missing}
         return arrays, stats
 
@@ -487,7 +829,8 @@ class _PinnedRing:
     """
 
     def __init__(self, capacity: int) -> None:
-        self._buf = torch.empty(capacity, dtype=torch.uint8, pin_memory=True)
+        self._pin = torch.cuda.is_available()
+        self._buf = torch.empty(capacity, dtype=torch.uint8, pin_memory=self._pin)
         self._cap = capacity
         self._live: "collections.deque[tuple[int, int]]" = collections.deque()
         self._cv = threading.Condition()
@@ -506,7 +849,7 @@ class _PinnedRing:
         self, nbytes: int, block: bool = True
     ) -> Optional[tuple[torch.Tensor, Any]]:
         if nbytes > self._cap // 2:
-            return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True), None
+            return torch.empty(nbytes, dtype=torch.uint8, pin_memory=self._pin), None
         with self._cv:
             while (start := self._fit(nbytes)) is None:
                 if not block:

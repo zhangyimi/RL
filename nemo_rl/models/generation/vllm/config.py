@@ -433,11 +433,12 @@ def _apply_trace_config(
         raise ValueError(
             f"nvfp4_pertoken_rollout.trace supports GRPO only, got {entry_point}"
         )
-    if vllm_cfg.get("async_engine"):
-        # The async engine (and SingleController) returns routed experts
-        # without the TRACE payload.
+    if vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server"):
+        # Only the token generate path (generate_async) returns TRACE rows;
+        # HTTP (NeMo-Gym / OpenAI server) rollouts would drop them.
         raise ValueError(
-            "nvfp4_pertoken_rollout.trace requires vllm_cfg.async_engine=false"
+            "nvfp4_pertoken_rollout.trace with vllm_cfg.async_engine=true does not "
+            "support vllm_cfg.expose_http_server=true"
         )
     tp = vllm_cfg.get("tensor_parallel_size", 1)
     if tp != 1 and vllm_cfg.get("expert_parallel_size", 1) != tp:

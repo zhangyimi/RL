@@ -251,6 +251,9 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache
 
         self._chain_prefix = ChainPrefixCache()
+        # TRACE rows of finished requests (created on first use when TRACE
+        # capture is requested).
+        self._trace_collector: Any | None = None
 
         super().__init__(
             config,
@@ -280,6 +283,29 @@ class VllmAsyncGenerationWorkerImpl(
         return bool(
             self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
         )
+
+    def _get_trace_collector(self) -> Any | None:
+        """The TRACE row collector, or None when TRACE capture is off."""
+        if self._trace_collector is None:
+            from nemo_rl.quantization.trace.layout import trace_requested
+
+            if not trace_requested():
+                return None
+            from nemo_rl.models.generation.vllm.quantization.trace_async import (
+                AsyncTraceCollector,
+            )
+
+            async def rpc(collect_items, register_items, release_ids):
+                # The side store lives in the engine core (TP=1) or the Ray
+                # GPU workers (TP>1), never in this process.
+                return await resolve_collective_rpc_result(
+                    self.llm.collective_rpc(
+                        "trace_sync", args=(collect_items, register_items, release_ids)
+                    )
+                )
+
+            self._trace_collector = AsyncTraceCollector(rpc)
+        return self._trace_collector
 
     def _reserve_port(self) -> None:
         """Bind and listen on a TCP socket to reserve a free port from the OS.
@@ -1709,6 +1735,7 @@ class VllmAsyncGenerationWorkerImpl(
         batch_specific_stop_strings_list = data.get(
             "stop_strings", [[] for _ in range(batch_size)]
         )
+        trace = self._get_trace_collector()
 
         # Create tasks for each sample in the batch
         async def process_single_sample(sample_idx):
@@ -1782,6 +1809,8 @@ class VllmAsyncGenerationWorkerImpl(
                         "truncated": truncated_tensor,
                     }
                 )
+                if trace is not None:
+                    result_batch["trace_ref"] = [None]
 
                 return (sample_idx, result_batch)
 
@@ -1792,6 +1821,13 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
             request_id = str(uuid.uuid4())
+            if trace is not None:
+                # Lets requests that finish first take prefix-cache rows
+                # from this one while it is still running.
+                trace.register(
+                    request_id,
+                    input_ids_batch[sample_idx, :current_input_actual_length].tolist(),
+                )
 
             # Generate using vLLM async engine
             vllm_request_generator = self.llm.generate(
@@ -1802,11 +1838,25 @@ class VllmAsyncGenerationWorkerImpl(
 
             # Get the final result from the generator
             final_request_output = None
-            async for req_output in vllm_request_generator:
-                final_request_output = req_output
+            try:
+                async for req_output in vllm_request_generator:
+                    final_request_output = req_output
+                if final_request_output is None:
+                    raise RuntimeError(f"No output received for request {request_id}")
+            except BaseException:
+                if trace is not None:
+                    trace.release(request_id)
+                raise
 
-            if final_request_output is None:
-                raise RuntimeError(f"No output received for request {request_id}")
+            trace_ref = None
+            if trace is not None:
+                # Collected right away: the rows stay in the engine's host
+                # store until then.
+                trace_ref = await trace.collect(
+                    request_id,
+                    final_request_output.prompt_token_ids,
+                    final_request_output.outputs[0].token_ids,
+                )
 
             validate_rollout_prompt(
                 input_ids_batch[sample_idx, :current_input_actual_length].tolist(),
@@ -1944,6 +1994,9 @@ class VllmAsyncGenerationWorkerImpl(
                 )
             if routed_experts is not None:
                 result_dict["routed_experts"] = routed_experts.unsqueeze(0)
+            if trace is not None:
+                # Whole prompt+response-1 prefix, as the sync worker returns.
+                result_dict["trace_ref"] = [trace_ref]
 
             result_batch = BatchedDataDict[GenerationOutputSpec](result_dict)
 
@@ -2032,8 +2085,14 @@ class VllmAsyncGenerationWorkerImpl(
 
             # Get the final result from the generator
             final_request_output = None
-            async for req_output in vllm_request_generator:
-                final_request_output = req_output
+            trace = self._get_trace_collector()
+            try:
+                async for req_output in vllm_request_generator:
+                    final_request_output = req_output
+            finally:
+                if trace is not None:
+                    # Text generation returns no TRACE rows; free them.
+                    trace.release(request_id)
 
             if final_request_output is None:
                 raise RuntimeError(f"No output received for request {request_id}")

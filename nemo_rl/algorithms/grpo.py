@@ -612,6 +612,7 @@ def setup(
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
+        _validate_trace_async_grpo(generation_config, grpo_config)
     elif generation_config["backend"] == "dynamo":
         # Validate the complete managed-Dynamo boundary before allocating Ray
         # placement groups or starting any external services.
@@ -2413,6 +2414,26 @@ def _apply_configured_message_level_advantage_penalties(
         malformed_thinking_advantage=malformed_thinking_advantage,
         log_config=log_config,
     )
+
+
+def _validate_trace_async_grpo(generation_config: Any, grpo_config: Any) -> None:
+    """TRACE with async GRPO needs a prefix-cache reset at every refit.
+
+    The rollout side store matches prefix-cache hits to donor rows of the same
+    cache generation; without a reset per weight update, cached prompts from
+    older weights would donate rows and the donor pool would never be freed.
+    """
+    from nemo_rl.quantization.trace.layout import LAYERS_ENV
+
+    env_vars = (generation_config.get("vllm_cfg") or {}).get("env_vars") or {}
+    async_cfg = grpo_config.async_grpo
+    if not env_vars.get(LAYERS_ENV) or async_cfg is None or not async_cfg.enabled:
+        return
+    if not async_cfg.recompute_kv_cache_after_weight_updates:
+        raise ValueError(
+            "nvfp4_pertoken_rollout.trace with grpo.async_grpo.enabled=true "
+            "requires grpo.async_grpo.recompute_kv_cache_after_weight_updates=true"
+        )
 
 
 def _preserve_router_replay_routed_experts(

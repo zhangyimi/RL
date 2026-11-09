@@ -692,6 +692,19 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """Return the host shared by worker processes on this node."""
         return socket.gethostname()
 
+    def trace_sync(
+        self,
+        collect_items: list,
+        register_items: list,
+        release_ids: list,
+    ) -> list | None:
+        """TRACE rows of finished async-engine requests (see trace_capture)."""
+        from nemo_rl.models.generation.vllm.quantization import trace_capture
+
+        return trace_capture.trace_sync_on_worker(
+            collect_items, register_items, release_ids
+        )
+
     def get_zmq_address(self):
         """Get the ZMQ address for the current device."""
         return f"ipc:///tmp/{self.report_device_id()}.sock"
