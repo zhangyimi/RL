@@ -1,6 +1,6 @@
 #!/bin/bash
 # Manual two-step check of TRACE (rollout-guided NVFP4 rounding) on the full
-# 8-node per-token NVFP4 recipe: rollout capture, FlashInfer fc2 overlay and
+# 8-node per-token NVFP4 recipe: rollout capture, FlashInfer fc2_input_out capture and
 # training-side guidance must all be active.
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source "$SCRIPT_DIR/common.env"
@@ -35,7 +35,7 @@ uv run --no-sync examples/run_grpo.py \
     2>&1 | tee "$RUN_LOG"
 
 grep -q "\[trace\] rollout capture active" "$RUN_LOG"
-grep -q "\[trace\] FlashInfer TRT-LLM MoE routed through the fc2-capture overlay" "$RUN_LOG"
+grep -q "\[trace\] rollout capture active" "$RUN_LOG"
 grep -q "\[trace\] QAT fake quantization on" "$RUN_LOG"
 
 uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"

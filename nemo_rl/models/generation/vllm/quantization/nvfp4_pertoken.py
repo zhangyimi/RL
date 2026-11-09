@@ -584,14 +584,10 @@ class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
         if trace_requested():
             assert self.experts_cls is not None
             self.experts_cls = trace_experts_cls(self.experts_cls)
-            # Runs in the vLLM worker process during model construction, i.e.
-            # before FlashInfer loads its MoE module for the profile run.
+            # Fail at model construction rather than at the first rollout.
             from nemo_rl.models.generation.vllm.quantization import trace_capture
 
-            if trace_capture.fc2_capture_mode() == "overlay":
-                from nemo_rl.models.generation.vllm.quantization import trace_fi_fc2
-
-                trace_fi_fc2.install()
+            trace_capture.require_fc2_api()
 
     def process_weights_after_loading(self, layer) -> None:
         """Finalize reload-format weights for dynamic per-token activation FP4.

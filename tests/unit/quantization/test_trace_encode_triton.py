@@ -75,7 +75,7 @@ def test_fused_fc1_under_cuda_graph():
 
 
 def _fc2_reference(codes, sf, tok, width):
-    """Bytes the FlashInfer fc2 overlay writes: marker, then per slot
+    """fc2 record bytes: marker, then per slot
     [mantissa-bit mask (element i at bit i % 8 of byte i // 8) | fp32 | E4M3]."""
     from nemo_rl.quantization.trace import layout as L
 
@@ -96,7 +96,7 @@ def _fc2_reference(codes, sf, tok, width):
 
 @pytest.mark.parametrize("width,pad,topk", [(768, 0, 8), (1856, 64, 6)])
 @pytest.mark.parametrize("n", [1, 48, 777])
-def test_fused_fc2_matches_overlay_format(width, pad, topk, n):
+def test_fused_fc2_matches_record_format(width, pad, topk, n):
     from nemo_rl.quantization.trace.encode_triton import encode_fc2_into
 
     g = torch.Generator(device="cuda").manual_seed(n + width)

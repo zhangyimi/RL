@@ -89,7 +89,6 @@ class TraceLayout:
             rows = _ceil_div(self.fc1_bytes, self.topk)
             self.fc1_records[layer] = SiteRecord(layer, offset, rows)
             offset += rows
-            # The FlashInfer overlay writes the fc2 record directly.
             rows = _ceil_div(self.fc2_bytes, self.topk)
             self.fc2_records[layer] = SiteRecord(layer, offset, rows)
             offset += rows
