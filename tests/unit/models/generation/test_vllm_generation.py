@@ -1262,6 +1262,17 @@ def test_nvfp4_pertoken_rejects_unsupported_topology(mutation):
         )
 
 
+def test_nvfp4_pertoken_accepts_expert_parallel_over_tp() -> None:
+    """EP equal to TP keeps experts whole on one rank (no vLLM DP)."""
+    config = _make_nvfp4_pertoken_generation_config()
+    _deep_update(
+        config, {"vllm_cfg": {"tensor_parallel_size": 2, "expert_parallel_size": 2}}
+    )
+    configure_generation_config(
+        config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+    )
+
+
 @pytest.mark.parametrize("async_engine", [False, True])
 def test_nvfp4_pertoken_accepts_non_colocated_reload_refit(async_engine: bool) -> None:
     """Non-colocated rollout quantizes inside the collective native reload."""

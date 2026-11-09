@@ -59,6 +59,7 @@ _SIDE: Optional["SideStore"] = None
 # count. Falls back to the source overlay in trace_fi_fc2 otherwise.
 FC2_ENV = "NRL_TRACE_FC2"  # auto (default) | api | overlay
 _FC2_SCRATCH: Optional[tuple] = None
+_TP_MERGE: Any = None  # vLLM TP group when TP>1 (expert parallel)
 _FC2_WANTED = False
 _FC2_TOKENS = 0
 
@@ -129,14 +130,24 @@ def register_capturer(capturer: Any, vllm_config: Any) -> None:
     global _LAYOUT, _TRACE_BUF, _SIDE
     if not trace_layout.trace_requested():
         return
-    tp = int(vllm_config.parallel_config.tensor_parallel_size)
-    if tp != 1:
-        # fc2 shards on TP>1 would each see only part of the record.
+    global _TP_MERGE
+    pc = vllm_config.parallel_config
+    tp = int(pc.tensor_parallel_size)
+    if tp > 1 and not pc.enable_expert_parallel:
+        # TP-sharded experts quantize each fc2 row slice with its own per-token
+        # scale, which the trainer (whole experts) does not reproduce.
         raise ValueError(
-            f"TRACE capture requires vLLM tensor_parallel_size=1, got {tp}"
+            "TRACE capture with vLLM tensor_parallel_size>1 requires expert "
+            f"parallelism (expert_parallel_size == tensor_parallel_size), got TP={tp}"
         )
-    if vllm_config.parallel_config.data_parallel_size != 1:
+    if pc.data_parallel_size != 1:
         raise RuntimeError("TRACE capture supports vLLM data_parallel_size=1 only")
+    if tp > 1:
+        # Each rank fills the fc2 slots of its local experts (others stay zero);
+        # rows are max-reduced onto the output rank every step.
+        from vllm.distributed.parallel_state import get_tp_group
+
+        _TP_MERGE = get_tp_group()
     from nemo_rl.models.generation.vllm.quantization import trace_fi_fc2
 
     fc2_mode = fc2_capture_mode()
@@ -174,6 +185,33 @@ def collect_trace_rows(outputs) -> Optional[list]:
     return [a.reshape(a.shape[0], e, k) for a in rows]
 
 
+def collect_trace_refs_on_worker(worker, items) -> Optional[list]:
+    """``collective_rpc`` target for multi-process vLLM (TP>1, Ray executor).
+
+    The side store lives in the vLLM GPU workers; TP rank 0 holds the merged
+    rows. ``items``: ``(request_id, prompt_token_ids, token_ids)`` per output.
+    Returns one Ray ref (or None for an empty row set) per item on rank 0,
+    None on the other ranks.
+    """
+    import types
+
+    import ray
+
+    del worker
+    if _SIDE is None or (_TP_MERGE is not None and not _TP_MERGE.is_first_rank):
+        return None
+    outs = [
+        types.SimpleNamespace(
+            request_id=r,
+            prompt_token_ids=p,
+            outputs=[types.SimpleNamespace(token_ids=t)],
+        )
+        for r, p, t in items
+    ]
+    rows = collect_trace_rows(outs)
+    return [ray.put(a) if len(a) else None for a in rows]
+
+
 def _install_side_store_hook() -> None:
     """Hand every engine step's TRACE rows to the side store.
 
@@ -189,6 +227,15 @@ def _install_side_store_hook() -> None:
     orig = cls.prepare_output
 
     def prepare_output(self, input_batch):
+        if _TP_MERGE is not None and _TRACE_BUF is not None:
+            n = int(input_batch.query_start_loc_np[len(input_batch.req_ids)])
+            if n:
+                torch.distributed.reduce(
+                    _TRACE_BUF[:n],
+                    dst=_TP_MERGE.ranks[0],
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=_TP_MERGE.device_group,
+                )
         pending = orig(self, input_batch)
         if pending is not None and _SIDE is not None:
             _SIDE.on_step(

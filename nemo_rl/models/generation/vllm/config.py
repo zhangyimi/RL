@@ -439,9 +439,13 @@ def _apply_trace_config(
         raise ValueError(
             "nvfp4_pertoken_rollout.trace requires vllm_cfg.async_engine=false"
         )
-    if vllm_cfg.get("tensor_parallel_size", 1) != 1:
+    tp = vllm_cfg.get("tensor_parallel_size", 1)
+    if tp != 1 and vllm_cfg.get("expert_parallel_size", 1) != tp:
+        # TP-sharded experts quantize each fc2 row slice with its own per-token
+        # scale; expert parallel keeps every expert whole on one rank.
         raise ValueError(
-            "nvfp4_pertoken_rollout.trace requires vLLM tensor_parallel_size=1"
+            "nvfp4_pertoken_rollout.trace with vLLM tensor_parallel_size>1 requires "
+            "expert_parallel_size == tensor_parallel_size"
         )
     if not (policy_config.get("router_replay") or {}).get("enabled"):
         raise ValueError(
@@ -495,8 +499,12 @@ def validate_nvfp4_pertoken_generation(
             "a stage that owns quantized layers rejects another stage's expert "
             "weights during refit. Set generation.vllm_cfg.pipeline_parallel_size=1."
         )
-    if vllm_cfg.get("expert_parallel_size") != 1:
-        raise ValueError("generation.nvfp4_pertoken_rollout requires vLLM EP=1")
+    ep, tp = vllm_cfg.get("expert_parallel_size"), vllm_cfg["tensor_parallel_size"]
+    if ep not in (1, tp):
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout supports vLLM EP=1 or EP=TP "
+            f"(expert parallel over the TP group), got EP={ep}, TP={tp}"
+        )
     if vllm_cfg.get("kv_cache_dtype") != "auto":
         raise ValueError(
             "generation.nvfp4_pertoken_rollout requires kv_cache_dtype=auto"

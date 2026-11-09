@@ -1172,6 +1172,28 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
         # TRACE rows [prompt+response-1, extra_rows, topk] per output.
         trace_rows = trace_capture.collect_trace_rows(outputs)
+        trace_remote = None
+        if trace_rows is None:
+            from nemo_rl.quantization.trace.layout import trace_requested
+
+            if trace_requested():
+                # Multi-process vLLM (TP>1): the rows live in the GPU workers.
+                items = [
+                    (
+                        o.request_id,
+                        list(o.prompt_token_ids),
+                        list(o.outputs[0].token_ids),
+                    )
+                    for o in outputs
+                ]
+                results = self.llm.collective_rpc(
+                    trace_capture.collect_trace_refs_on_worker, args=(items,)
+                )
+                trace_remote = next((r for r in results if r is not None), None)
+                if trace_remote is None:
+                    raise RuntimeError(
+                        "TRACE is enabled but no vLLM worker returned trace rows"
+                    )
         r3_missing_routes = []
         r3_expected_routes = []
         r3_actual_routes = []
@@ -1252,7 +1274,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 r3_actual_routes.append(r3_stats["actual_routes"])
             if full_routed_experts is not None:
                 routed_experts_list.append(full_routed_experts)
-            if trace_rows is not None:
+            if trace_remote is not None:
+                trace_refs.append(trace_remote[i])
+            elif trace_rows is not None:
                 # TRACE payload stays in this node's object store; only the
                 # ref crosses the driver (see trace_apply.attach_trace_rows).
                 trace_np, trace_rows[i] = trace_rows[i], None
@@ -1306,7 +1330,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         )
         if routed_experts_list:
             return_data["routed_experts"] = torch.stack(routed_experts_list)
-        if trace_rows is not None:
+        if trace_rows is not None or trace_remote is not None:
             return_data["trace_ref"] = trace_refs
         if r3_missing_routes:
             return_data["r3_routed_experts_missing_routes"] = torch.tensor(
