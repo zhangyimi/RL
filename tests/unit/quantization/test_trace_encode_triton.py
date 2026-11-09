@@ -72,3 +72,47 @@ def test_fused_fc1_under_cuda_graph():
     expect = torch.zeros_like(out)
     encode_fc1_into(expect, codes, sf, tok, hidden)
     torch.testing.assert_close(out, expect, rtol=0, atol=0)
+
+
+def _fc2_reference(codes, sf, tok, width):
+    """Bytes the FlashInfer fc2 overlay writes: marker, then per slot
+    [mantissa-bit mask (element i at bit i % 8 of byte i // 8) | fp32 | E4M3]."""
+    from nemo_rl.quantization.trace import layout as L
+
+    n, topk, _ = codes.shape
+    c = codes[..., : width // 2].to(torch.int32)
+    nib = torch.stack([c & 15, c >> 4], dim=-1).reshape(n, topk, width)
+    bits = (nib & 1).reshape(n, topk, width // 8, 8)
+    weights = torch.tensor([1 << i for i in range(8)], device=codes.device)
+    lsb = (bits * weights).sum(-1).to(torch.uint8)
+    slot = torch.cat(
+        [lsb, tok.reshape(n, topk, 1).view(torch.uint8), sf[..., : width // 16]], dim=-1
+    )
+    marker = torch.full(
+        (n, L.MARKER_BYTES), L.MARKER, dtype=torch.uint8, device=codes.device
+    )
+    return torch.cat([marker, slot.reshape(n, -1)], dim=-1)
+
+
+@pytest.mark.parametrize("width,pad,topk", [(768, 0, 8), (1856, 64, 6)])
+@pytest.mark.parametrize("n", [1, 48, 777])
+def test_fused_fc2_matches_overlay_format(width, pad, topk, n):
+    from nemo_rl.quantization.trace.encode_triton import encode_fc2_into
+
+    g = torch.Generator(device="cuda").manual_seed(n + width)
+    inter = width + pad  # kernel width may be padded past the record width
+    codes = torch.randint(
+        0, 256, (n, topk, inter // 2), dtype=torch.uint8, device="cuda", generator=g
+    )
+    sf = torch.randint(
+        0, 256, (n, topk, inter // 16), dtype=torch.uint8, device="cuda", generator=g
+    )
+    tok = torch.rand(n, topk, device="cuda", generator=g) * 7 + 1e-3
+    want = _fc2_reference(codes, sf, tok, width)
+
+    rec_bytes = want.shape[1]
+    buf = torch.full((n + 2, rec_bytes + 40), 0x3C, dtype=torch.uint8, device="cuda")
+    ref = buf.clone()
+    ref[:n, 8 : 8 + rec_bytes] = want
+    encode_fc2_into(buf[:n, 8:], codes, sf, tok, width)
+    torch.testing.assert_close(buf, ref, rtol=0, atol=0)

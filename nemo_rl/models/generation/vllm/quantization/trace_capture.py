@@ -53,6 +53,76 @@ _CURRENT_MOE_LAYER: Optional[int] = None
 _TRACE_BUF: Optional[torch.Tensor] = None
 _SIDE: Optional["SideStore"] = None
 
+# fc2 capture through FlashInfer's ``fc2_input_out`` (when the installed
+# FlashInfer has it): scratch shared by all layers, the request flag set by
+# TraceFc2CaptureMixin around one layer's kernel call, and that call's token
+# count. Falls back to the source overlay in trace_fi_fc2 otherwise.
+FC2_ENV = "NRL_TRACE_FC2"  # auto (default) | api | overlay
+_FC2_SCRATCH: Optional[tuple] = None
+_FC2_WANTED = False
+_FC2_TOKENS = 0
+
+
+def fc2_capture_mode() -> str:
+    """``"api"`` when FlashInfer accepts ``fc2_input_out``, else ``"overlay"``."""
+    import inspect
+    import os
+
+    want = os.environ.get(FC2_ENV, "auto")
+    if want not in ("auto", "api", "overlay"):
+        raise ValueError(f"{FC2_ENV} must be auto, api or overlay, got {want!r}")
+    if want == "overlay":
+        return "overlay"
+    from flashinfer import fused_moe
+
+    has_api = (
+        "fc2_input_out"
+        in inspect.signature(fused_moe.trtllm_fp4_block_scale_routed_moe).parameters
+    )
+    if want == "api" and not has_api:
+        raise RuntimeError(
+            f"{FC2_ENV}=api but the installed FlashInfer has no fc2_input_out"
+        )
+    return "api" if has_api else "overlay"
+
+
+def _install_fc2_api() -> None:
+    """Pass ``fc2_input_out`` on the MoE calls TraceFc2CaptureMixin asks for.
+
+    vLLM looks the entry points up on ``flashinfer.fused_moe`` at call time.
+    """
+    import functools
+
+    from flashinfer import fused_moe
+
+    def wrap(fn):
+        if getattr(fn, "_nrl_trace", False):
+            return fn
+
+        @functools.wraps(fn)
+        def call(*args, **kwargs):
+            global _FC2_SCRATCH, _FC2_TOKENS
+            if not _FC2_WANTED:
+                return fn(*args, **kwargs)
+            hidden = kwargs.get("hidden_states", args[2] if len(args) > 2 else None)
+            topk, inter = kwargs["top_k"], kwargs["intermediate_size"]
+            rows = _TRACE_BUF.shape[0]
+            if _FC2_SCRATCH is None or _FC2_SCRATCH[0].shape[1:] != (topk, inter // 2):
+                dev = _TRACE_BUF.device
+                _FC2_SCRATCH = (
+                    torch.empty(rows, topk, inter // 2, dtype=torch.uint8, device=dev),
+                    torch.empty(rows, topk, inter // 16, dtype=torch.uint8, device=dev),
+                    torch.empty(rows, topk, dtype=torch.float32, device=dev),
+                )
+            _FC2_TOKENS = int(hidden.shape[0])
+            return fn(*args, fc2_input_out=_FC2_SCRATCH, **kwargs)
+
+        call._nrl_trace = True  # type: ignore[attr-defined]
+        return call
+
+    for name in ("trtllm_fp4_block_scale_routed_moe", "trtllm_fp4_block_scale_moe"):
+        setattr(fused_moe, name, wrap(getattr(fused_moe, name)))
+
 
 def register_capturer(capturer: Any, vllm_config: Any) -> None:
     """Called from the patched ``RoutedExpertsCapturer.__init__``."""
@@ -69,8 +139,11 @@ def register_capturer(capturer: Any, vllm_config: Any) -> None:
         raise RuntimeError("TRACE capture supports vLLM data_parallel_size=1 only")
     from nemo_rl.models.generation.vllm.quantization import trace_fi_fc2
 
-    if not trace_fi_fc2._INSTALLED:
+    fc2_mode = fc2_capture_mode()
+    if fc2_mode == "overlay" and not trace_fi_fc2._INSTALLED:
         raise RuntimeError("TRACE fc2 capture requires the FlashInfer overlay")
+    if fc2_mode == "api":
+        _install_fc2_api()
     layout = trace_layout.layout_for_hf_config(vllm_config.model_config.hf_text_config)
     _LAYOUT = layout
     _TRACE_BUF = torch.zeros(
@@ -84,7 +157,7 @@ def register_capturer(capturer: Any, vllm_config: Any) -> None:
     _install_fc1_capture()
     print(
         f"[trace] rollout capture active: layout={layout.to_json()} "
-        f"extra_rows={layout.extra_rows}",
+        f"extra_rows={layout.extra_rows} fc2={fc2_mode}",
         flush=True,
     )
 
@@ -483,6 +556,8 @@ class TraceFc2CaptureMixin:
         from nemo_rl.models.generation.vllm.quantization import trace_fi_fc2
 
         buf = _TRACE_BUF
+        if not trace_fi_fc2._INSTALLED:
+            return self._apply_fc2_api(rec, hidden_states, *args, **kwargs)
         # The kernel writes [marker | slots] straight into this layer's record
         # (layout.encode_fc2 format); the pointer is baked per layer under CUDA graphs.
         trace_fi_fc2.set_fc2_out(
@@ -495,6 +570,23 @@ class TraceFc2CaptureMixin:
             out = super().apply(hidden_states, *args, **kwargs)  # type: ignore[misc]
         finally:
             trace_fi_fc2.set_fc2_out(None)
+        return out
+
+    def _apply_fc2_api(self, rec, hidden_states, *args, **kwargs):
+        global _FC2_WANTED
+        from nemo_rl.quantization.trace.encode_triton import encode_fc2_into
+
+        _FC2_WANTED = True
+        try:
+            out = super().apply(hidden_states, *args, **kwargs)  # type: ignore[misc]
+        finally:
+            _FC2_WANTED = False
+        n, k = _FC2_TOKENS, _LAYOUT.topk
+        codes, scales, tokens = (t[:n] for t in _FC2_SCRATCH)  # type: ignore[index]
+        dst = _TRACE_BUF[:n].view(n, -1)[
+            :, rec.row_offset * k : (rec.row_offset + rec.rows) * k
+        ]
+        encode_fc2_into(dst, codes, scales, tokens, _LAYOUT.moe_intermediate_size)
         return out
 
 
