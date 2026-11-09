@@ -1187,7 +1187,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                     for o in outputs
                 ]
                 results = self.llm.collective_rpc(
-                    trace_capture.collect_trace_refs_on_worker, args=(items,)
+                    trace_capture.collect_trace_rows_on_worker, args=(items,)
                 )
                 trace_remote = next((r for r in results if r is not None), None)
                 if trace_remote is None:
@@ -1275,7 +1275,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             if full_routed_experts is not None:
                 routed_experts_list.append(full_routed_experts)
             if trace_remote is not None:
-                trace_refs.append(trace_remote[i])
+                trace_np, trace_remote[i] = trace_remote[i], None
+                trace_refs.append(ray.put(trace_np) if len(trace_np) else None)
+                del trace_np
             elif trace_rows is not None:
                 # TRACE payload stays in this node's object store; only the
                 # ref crosses the driver (see trace_apply.attach_trace_rows).

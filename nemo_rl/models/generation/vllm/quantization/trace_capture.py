@@ -187,25 +187,33 @@ def collect_trace_rows(outputs) -> Optional[list]:
     return [a.reshape(a.shape[0], e, k) for a in rows]
 
 
-def collect_trace_refs_on_worker(worker, items) -> Optional[list]:
+def collect_trace_rows_on_worker(worker, items) -> Optional[list]:
     """``collective_rpc`` target for multi-process vLLM (TP>1, Ray executor).
 
     The side store lives in the vLLM GPU workers; TP rank 0 holds the merged
     rows. ``items``: ``(request_id, prompt_token_ids, token_ids)`` per output.
-    Returns one Ray ref (or None for an empty row set) per item on rank 0,
-    None on the other ranks.
+    Returns the row arrays on rank 0, None on the other ranks. The caller
+    ``ray.put``s them: a ref made here and passed back through
+    ``collective_rpc`` would lose its Ray ownership.
     """
-    import ray
+    import types
 
     del worker
     if _SIDE is None or (_TP_MERGE is not None and not _TP_MERGE.is_first_rank):
         return None
-    rows = collect_trace_rows(_as_outputs(items))
-    return [ray.put(a) if len(a) else None for a in rows]
+    outs = [
+        types.SimpleNamespace(
+            request_id=r,
+            prompt_token_ids=p,
+            outputs=[types.SimpleNamespace(token_ids=t)],
+        )
+        for r, p, t in items
+    ]
+    return collect_trace_rows(outs)
 
 
 def trace_sync_on_worker(collect_items, register_items, release_ids) -> Optional[list]:
-    """Async-engine counterpart of :func:`collect_trace_refs_on_worker`.
+    """Async-engine counterpart of :func:`collect_trace_rows_on_worker`.
 
     Runs in the process that owns the side store (the AsyncLLM engine core
     with TP=1, the Ray GPU workers with TP>1), reached by name through the
