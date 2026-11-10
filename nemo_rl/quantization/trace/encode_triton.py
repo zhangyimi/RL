@@ -174,7 +174,7 @@ def encode_fc2_into(
     ``codes`` ``[n, topk, I/2]`` uint8, ``block_scale`` ``[n, topk, I/16]``,
     ``token_scale`` ``[n, topk]`` fp32, where ``I`` may be padded beyond the
     record ``width``. ``out``: ``[n, >= record bytes]`` uint8 view. Only the
-    marker and the slots are written.
+    marker and the slots are written, as the FlashInfer overlay does.
     """
     n, topk, code_bytes = codes.shape
     if n == 0:

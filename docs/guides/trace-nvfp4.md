@@ -14,7 +14,7 @@ TRACE ([arXiv 2610.07767](https://arxiv.org/abs/2610.07767)) reduces the mismatc
 - Per-token NVFP4 rollout (`generation.nvfp4_pertoken_rollout.enabled: true`) with Megatron training.
 - A TE precision recipe that keeps the routed experts in BF16 (`examples/te_precision/all_bf16_trace_qat.yaml`); the trainer checks this.
 - Router replay (`policy.router_replay.enabled: true`).
-- FlashInfer with the `fc2_input_out` argument of the TRT-LLM FP4 MoE (flashinfer-ai/flashinfer#9232). Until a release includes it, install a build of that PR into the vLLM worker venvs; TRACE refuses to start without it.
+- FlashInfer: if the installed FlashInfer has the `fc2_input_out` argument of the TRT-LLM FP4 MoE (flashinfer-ai/flashinfer#9232), TRACE uses it. Otherwise TRACE patches that MoE module at runtime and FlashInfer JIT-compiles it on the first run (about 15 minutes); point `FLASHINFER_WORKSPACE_BASE` (in `vllm_cfg.env_vars`) at a shared directory to reuse the build.
 
 ## Configuration
 
@@ -87,5 +87,5 @@ Plain NVFP4 training drifts from the rollout as training goes on and collapses; 
 ## Limitations
 
 - One bit cannot fix every element: when the training value is too far from the rollout value, neither neighbor matches. These cases grow with depth.
-- The rollout-side hooks patch vLLM sources at fixed anchors. They are validated on the pinned vLLM nightly, and fail loudly on a version they do not match.
+- The rollout-side hooks patch vLLM and FlashInfer sources at fixed anchors. They are validated on the pinned vLLM nightly and FlashInfer 0.7, and fail loudly on a version they do not match.
 - SingleController and HTTP rollouts (`vllm_cfg.expose_http_server`, NeMo-Gym) are not supported yet.
