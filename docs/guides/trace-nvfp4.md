@@ -14,9 +14,7 @@ TRACE ([arXiv 2610.07767](https://arxiv.org/abs/2610.07767)) reduces the mismatc
 - Per-token NVFP4 rollout (`generation.nvfp4_pertoken_rollout.enabled: true`) with Megatron training.
 - A TE precision recipe that keeps the routed experts in BF16 (`examples/te_precision/all_bf16_trace_qat.yaml`); the trainer checks this.
 - Router replay (`policy.router_replay.enabled: true`).
-- vLLM tensor parallel size 1, or TP>1 with expert parallel (`expert_parallel_size` equal to `tensor_parallel_size`); GRPO.
-- With the async vLLM engine (`vllm_cfg.async_engine: true`) and async GRPO, set `grpo.async_grpo.recompute_kv_cache_after_weight_updates: true`.
-- The `fc2` codes and scales come from FlashInfer's `fc2_input_out` argument of the TRT-LLM FP4 MoE (flashinfer-ai/flashinfer#9232); the installed FlashInfer must have it. Until a FlashInfer release includes it, install a build of that PR into the vLLM worker venvs.
+- FlashInfer with the `fc2_input_out` argument of the TRT-LLM FP4 MoE (flashinfer-ai/flashinfer#9232). Until a release includes it, install a build of that PR into the vLLM worker venvs; TRACE refuses to start without it.
 
 ## Configuration
 
@@ -53,6 +51,28 @@ uv run examples/run_grpo.py \
   policy.megatron_cfg.first_last_layers_bf16=false \
   ++policy.generation.vllm_kwargs.async_scheduling=false \
   ++policy.generation.vllm_kwargs.num_gpu_blocks_override=16000
+```
+
+### Parallelism and async GRPO
+
+Megatron TP/CP/EP and sequence packing need nothing extra. On the vLLM side, MoE layers must not be split by TP: use TP=1, or TP>1 with expert parallel of the same size. For example, for TP2/EP2 add:
+
+```sh
+  policy.generation.vllm_cfg.tensor_parallel_size=2 \
+  policy.generation.vllm_cfg.expert_parallel_size=2
+```
+
+Async GRPO works with the async vLLM engine. KV-cache recompute after weight updates is required, and async GRPO itself does not support dynamic sampling or reward scaling/shaping:
+
+```sh
+  grpo.async_grpo.enabled=true \
+  grpo.async_grpo.recompute_kv_cache_after_weight_updates=true \
+  policy.generation.vllm_cfg.async_engine=true \
+  policy.generation.colocated.enabled=false \
+  policy.generation.colocated.resources.num_nodes=4 \
+  policy.generation.colocated.resources.gpus_per_node=4 \
+  grpo.use_dynamic_sampling=false grpo.batch_multiplier=1.0 \
+  grpo.reward_scaling.enabled=false grpo.reward_shaping.enabled=false
 ```
 
 ## Results
