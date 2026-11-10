@@ -64,7 +64,7 @@ Megatron TP/CP/EP and sequence packing need nothing extra. On the vLLM side, MoE
 
 ### Async GRPO
 
-The recipes above are validated synchronously only. Async is untested; to try it, append:
+Async GRPO with the async vLLM engine has passed short tests only; there is no async recipe yet. To try it, append:
 
 ```sh
   grpo.async_grpo.enabled=true \
@@ -73,10 +73,12 @@ The recipes above are validated synchronously only. Async is untested; to try it
   policy.generation.colocated.resources.num_nodes=2 \
   policy.generation.colocated.resources.gpus_per_node=4 \
   cluster.num_nodes=10 \
-  grpo.async_grpo.recompute_kv_cache_after_weight_updates=true  # TRACE only
+  grpo.async_grpo.recompute_kv_cache_after_weight_updates=true \
+  grpo.use_dynamic_sampling=false grpo.batch_multiplier=1.0 \
+  grpo.reward_scaling.enabled=false grpo.reward_shaping.enabled=false
 ```
 
-vLLM async needs separate generation nodes (here 2, so training keeps its 8). Note that the async loop skips dynamic sampling, reward scaling and the overlong penalty.
+Async generation runs on its own nodes (here 2, so training keeps its 8). TRACE needs the KV-cache recompute line. Async GRPO raises an error if dynamic sampling, reward scaling or reward shaping is on, so the recipe's settings for them are turned off.
 
 ## Results
 
