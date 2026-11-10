@@ -32,8 +32,8 @@ policy:
 
 Ready-made recipes:
 
-- `examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace.yaml`
-- `examples/configs/recipes/llm/grpo-nemotron35-lightning-30ba3b-8n4g-megatron-te-nvfp4-pertoken-trace.yaml`
+- `examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace.yaml` (validated, see [Results](#results))
+- `examples/configs/recipes/llm/grpo-nemotron35-lightning-30ba3b-8n4g-megatron-te-nvfp4-pertoken-trace.yaml` (smoke-tested only, no long run)
 
 The Qwen3 recipe has the settings of the runs below: every MoE layer in NVFP4, validation every 20 steps, synchronous vLLM scheduling, and `num_gpu_blocks_override: 16000` (only limits memory).
 
@@ -53,7 +53,7 @@ uv run examples/run_grpo.py \
   ++policy.generation.vllm_kwargs.num_gpu_blocks_override=16000
 ```
 
-### Parallelism and async GRPO
+### Parallelism
 
 Megatron TP/CP/EP and sequence packing need nothing extra. On the vLLM side, MoE layers must not be split by TP: use TP=1, or TP>1 with expert parallel of the same size. For example, for TP2/EP2 append to the command:
 
@@ -62,12 +62,21 @@ Megatron TP/CP/EP and sequence packing need nothing extra. On the vLLM side, MoE
   policy.generation.vllm_cfg.expert_parallel_size=2
 ```
 
-Async GRPO works with the async vLLM engine; TRACE additionally needs the KV cache recomputed after weight updates:
+### Async GRPO
+
+The recipes above are validated synchronously only. Async is untested; to try it, append:
 
 ```sh
+  grpo.async_grpo.enabled=true \
   policy.generation.vllm_cfg.async_engine=true \
-  grpo.async_grpo.recompute_kv_cache_after_weight_updates=true
+  policy.generation.colocated.enabled=false \
+  policy.generation.colocated.resources.num_nodes=2 \
+  policy.generation.colocated.resources.gpus_per_node=4 \
+  cluster.num_nodes=10 \
+  grpo.async_grpo.recompute_kv_cache_after_weight_updates=true  # TRACE only
 ```
+
+vLLM async needs separate generation nodes (here 2, so training keeps its 8). Note that the async loop skips dynamic sampling, reward scaling and the overlong penalty.
 
 ## Results
 
