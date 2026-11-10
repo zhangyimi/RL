@@ -62,24 +62,11 @@ Megatron TP/CP/EP and sequence packing need nothing extra. On the vLLM side, MoE
   policy.generation.vllm_cfg.expert_parallel_size=2
 ```
 
-Async GRPO (generation on its own nodes, running ahead of training) is supported with the async vLLM engine. Two things differ from the synchronous run:
-
-- TRACE needs `grpo.async_grpo.recompute_kv_cache_after_weight_updates=true`, so that every recorded token comes from a single weight version.
-- Async GRPO itself (independent of TRACE) does not support dynamic sampling or reward scaling/shaping; turn them off. Without the overlong penalty, `grpo.overlong_filtering=true` is an option.
-
-Full command for the Qwen3 recipe, with 4 generation and 4 training nodes:
+Async GRPO works with the async vLLM engine; TRACE additionally needs the KV cache recomputed after weight updates:
 
 ```sh
-uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-trace.yaml \
-  grpo.async_grpo.enabled=true \
-  grpo.async_grpo.recompute_kv_cache_after_weight_updates=true \
   policy.generation.vllm_cfg.async_engine=true \
-  policy.generation.colocated.enabled=false \
-  policy.generation.colocated.resources.num_nodes=4 \
-  policy.generation.colocated.resources.gpus_per_node=4 \
-  grpo.use_dynamic_sampling=false grpo.batch_multiplier=1.0 \
-  grpo.reward_scaling.enabled=false grpo.reward_shaping.enabled=false
+  grpo.async_grpo.recompute_kv_cache_after_weight_updates=true
 ```
 
 ## Results
