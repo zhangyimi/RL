@@ -832,17 +832,18 @@ def test_recovery_target_enables_required_checkpoint_capabilities(
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
-    @pytest.mark.parametrize("colocated", [False, True])
-    def test_nvfp4_pertoken_rejected_before_setup_factories(
-        self, patched_factories: dict[str, Any], colocated: bool
+    def test_nvfp4_pertoken_accepted_with_non_colocated_vllm(self) -> None:
+        mc = _make_master_config(megatron_enabled=True)
+        mc.policy["generation"]["nvfp4_pertoken_rollout"] = {"enabled": True}
+        validate_single_controller_config(mc)
+
+    def test_nvfp4_pertoken_colocated_vllm_rejected_before_setup_factories(
+        self, patched_factories: dict[str, Any]
     ) -> None:
-        mc = _make_master_config(colocated=colocated, megatron_enabled=True)
+        mc = _make_master_config(colocated=True, megatron_enabled=True)
         mc.policy["generation"]["nvfp4_pertoken_rollout"] = {"enabled": True}
 
-        with pytest.raises(
-            ValueError,
-            match="SingleController does not support generation.nvfp4_pertoken_rollout",
-        ):
+        with pytest.raises(ValueError, match="colocated.enabled=false"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         for factory in (

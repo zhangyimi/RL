@@ -21,7 +21,7 @@ boundary layers remain in BF16. The policy backward pass currently uses TE's
 dequantized path.
 
 After every policy update, NeMo RL exports the updated BF16 weights to each
-colocated vLLM engine. The rollout workers quantize routed-expert weights while
+vLLM engine, colocated or not. The rollout workers quantize routed-expert weights while
 vLLM's native `reload_weights` API consumes the checkpoint-format stream before
 the next rollout. Training remains unaware of the rollout representation.
 
@@ -78,6 +78,11 @@ post-processing, and completes the final device fence. If preparation or load
 fails, NeMo RL drains and acknowledges the remaining IPC messages so the sender
 cannot deadlock, and the rollout worker raises instead of serving stale
 weights.
+
+A non-colocated engine receives the same BF16 stream as NCCL broadcasts instead
+of CUDA IPC and feeds it to `reload_weights` through the same quantizer. If
+preparation or load fails, it still receives the remaining broadcasts so the
+policy workers are not left blocked, then raises.
 
 ### Per-token vLLM rollout
 
@@ -139,6 +144,21 @@ For migration, an explicit `additional_ignore` is accepted only when it uses
 complete `*.layers.<index>.mlp.experts*` patterns and exactly matches that
 derived boundary.
 
+### SingleController
+
+The SingleController path uses the same training and rollout settings with
+non-colocated vLLM rollout:
+
+```bash
+uv run examples/run_grpo_single_controller.py \
+  --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-single-controller.yaml
+```
+
+The recipe trains on 4 nodes and serves rollouts from the other 4. Validation
+is not available on SingleController yet, so the recipe turns it off. The
+recipe is on-policy (`in_order`, zero lookahead); the asynchronous samplers
+also work and pause in-flight rollouts across each quantized refit.
+
 ## Validated Configuration
 
 The shipped recipe captures the training and rollout settings used for the
@@ -176,13 +196,13 @@ models, but this release has the following enforced or validated boundaries:
 | Shared-expert fusion | A layout that fuses shared experts into the selected `RoutedExperts` container is rejected |
 | Hardware and kernel | NVIDIA Blackwell with the FlashInfer TRT-LLM NVFP4 fused-MoE backend; GB200 is validated |
 | Training precision | BF16 persistent parameters with `fp4_param=false`; backward computation uses TE's dequantized path |
-| Rollout placement | Colocated vLLM rollout only; standalone evaluation is not supported because the dummy-loaded engine requires a refit first |
+| Rollout placement | Colocated vLLM rollout on GRPO, non-colocated on SingleController; standalone evaluation is not supported because the dummy-loaded engine requires a refit first |
 | vLLM parallelism | EP and PP must be 1; PP>1 is rejected for both engine modes because refit does not yet handle another stage's expert weights. TP remains configurable; the shipped end-to-end recipe uses TP=1 |
 | Cache and decoding | `kv_cache_dtype=auto`; speculative decoding is not supported |
-| Refit transport | Default colocated CUDA IPC/ZMQ path (`refit_transport: null`) |
+| Refit transport | Default transport only (`refit_transport: null`): CUDA IPC/ZMQ when colocated, NCCL collective otherwise |
 | Configuration | `generation.quant_cfg`, `generation.real_quant`, and explicit vLLM quantization/load-format overrides are mutually exclusive with this mode |
 | Layer exclusions | Derived from the Megatron BF16 boundary; legacy `additional_ignore` must describe exactly the same complete expert layers |
-| Algorithm coverage | End-to-end validation is GRPO only. PPO and distillation reuse the same Megatron training worker and vLLM refit path and are expected to work, but are unvalidated and warn at setup. SingleController explicitly rejects this mode during configuration validation: its vLLM path requires non-colocated rollout, while this mode requires colocated rollout |
+| Algorithm coverage | End-to-end validation is GRPO only. PPO and distillation reuse the same Megatron training worker and vLLM refit path and are expected to work, but are unvalidated and warn at setup. SingleController runs this mode with non-colocated vLLM rollout; see [SingleController](#singlecontroller) |
 
 An additional architecture is eligible only when Megatron-Bridge can export its
 HF-named BF16 weights and the pinned vLLM model exposes a complete compatible
